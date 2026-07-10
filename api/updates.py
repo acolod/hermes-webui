@@ -1112,6 +1112,183 @@ def _ignored_agent_update_info() -> dict:
     return {'name': 'agent', 'behind': 0, 'ignored': True}
 
 
+def _agent_update_applyability_info() -> dict | None:
+    """Return Hermes Agent applyability metadata when available.
+
+    The WebUI and Hermes Agent ship as separate repos, but the WebUI often runs
+    inside the Hermes venv and can therefore ask the Agent runtime whether the
+    checkout should be updated via plain git pull or via a specialized workflow
+    such as local/live carries.
+    """
+    if _AGENT_DIR is None or not (Path(_AGENT_DIR) / '.git').exists():
+        return None
+    try:
+        from hermes_cli.web_server import _git_update_applyability  # type: ignore[reportMissingImports]
+    except BaseException:
+        return None
+    try:
+        info = _git_update_applyability()
+    except BaseException:
+        logger.exception('Failed to read Hermes Agent update applyability')
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def _merge_agent_applyability_info(info: dict | None) -> dict | None:
+    """Attach additive Agent applyability metadata without breaking legacy fields."""
+    if not isinstance(info, dict):
+        return info
+    applyability = _agent_update_applyability_info()
+    if not applyability:
+        return info
+    merged = dict(info)
+    merged['can_apply'] = bool(applyability.get('can_apply'))
+    if applyability.get('reason'):
+        merged['apply_reason'] = str(applyability['reason'])
+    if applyability.get('message'):
+        merged['apply_message'] = str(applyability['message'])
+    if applyability.get('update_command'):
+        merged['apply_update_command'] = str(applyability['update_command'])
+    if applyability.get('spawn_mode'):
+        merged['apply_spawn_mode'] = str(applyability['spawn_mode'])
+    if applyability.get('spawn_command'):
+        merged['apply_spawn_command'] = list(applyability['spawn_command'])
+    if applyability.get('branch'):
+        merged['local_branch'] = str(applyability['branch'])
+    if applyability.get('target_branch'):
+        merged['local_target_branch'] = str(applyability['target_branch'])
+    if 'ahead' in applyability:
+        merged['local_ahead'] = applyability.get('ahead')
+    if 'dirty' in applyability:
+        merged['local_dirty'] = bool(applyability.get('dirty'))
+    if 'dirty_entries' in applyability:
+        merged['local_dirty_entries'] = applyability.get('dirty_entries')
+    return merged
+
+
+def _run_external_update_command(command: list[str], *, cwd: Path | None = None, timeout: int = 300) -> tuple[str, bool]:
+    """Run an external updater command and return combined output plus success."""
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd is not None else None,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        return f'Command not found: {command[0]}', False
+    except subprocess.TimeoutExpired:
+        return f'{" ".join(command)} timed out after {timeout}s', False
+    except Exception as exc:
+        return str(exc), False
+    output = (completed.stdout or '').strip()
+    err = (completed.stderr or '').strip()
+    detail = err or output or f'command exited with status {completed.returncode}'
+    return detail, completed.returncode == 0
+
+
+def _resolve_webui_local_update_command() -> list[str] | None:
+    command = shutil.which('hermes-webui-local-update')
+    if command:
+        return [command]
+    candidate = Path.home() / '.local' / 'bin' / 'hermes-webui-local-update'
+    if candidate.exists():
+        return [str(candidate)]
+    return None
+
+
+def _branch_delta(path: Path, compare_ref: str) -> tuple[int, int]:
+    out, ok = _run_git(['rev-list', '--left-right', '--count', f'HEAD...{compare_ref}'], path)
+    if not ok or not out:
+        return 0, 0
+    parts = out.strip().split()
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        return 0, 0
+    return int(parts[0]), int(parts[1])
+
+
+def _webui_update_applyability_info() -> dict | None:
+    """Return WebUI local-carry metadata when this checkout has local commits."""
+    if REPO_ROOT is None or not (Path(REPO_ROOT) / '.git').exists():
+        return None
+    try:
+        branch, ok = _run_git(['symbolic-ref', '--quiet', '--short', 'HEAD'], REPO_ROOT)
+        if not (ok and branch):
+            return None
+        upstream, ok = _run_git(['rev-parse', '--abbrev-ref', '@{upstream}'], REPO_ROOT)
+        if ok and upstream:
+            compare_ref = upstream
+        else:
+            compare_ref = f'origin/{_detect_default_branch(REPO_ROOT)}'
+        ahead, behind = _branch_delta(REPO_ROOT, compare_ref)
+        if not ahead:
+            return None
+        command = _resolve_webui_local_update_command()
+        target_remote, target_branch = _split_remote_ref(compare_ref)
+        dirty = _is_dirty(REPO_ROOT)
+    except BaseException:
+        return None
+    info: dict[str, object] = {
+        'can_apply': bool(command and not dirty),
+        'reason': 'local_carry_rebase',
+        'message': (
+            'This WebUI checkout has local carry commits. The update button '
+            'will run hermes-webui-local-update so your local WebUI patches '
+            'are rebased onto updated upstream code.'
+        ),
+        'update_command': 'hermes-webui-local-update',
+        'branch': str(branch),
+        'target_branch': str(target_branch or compare_ref),
+        'ahead': ahead,
+        'behind': behind,
+        'dirty': dirty,
+        'dirty_entries': None,
+    }
+    if target_remote:
+        info['target_remote'] = str(target_remote)
+    if command:
+        info['spawn_mode'] = 'external'
+        info['spawn_command'] = list(command)
+    return info
+
+
+def _merge_applyability_info(info: dict | None, applyability: dict | None) -> dict | None:
+    """Attach additive applyability metadata without breaking legacy fields."""
+    if not isinstance(info, dict):
+        return info
+    if not applyability:
+        return info
+    merged = dict(info)
+    merged['can_apply'] = bool(applyability.get('can_apply'))
+    if applyability.get('reason'):
+        merged['apply_reason'] = str(applyability['reason'])
+    if applyability.get('message'):
+        merged['apply_message'] = str(applyability['message'])
+    if applyability.get('update_command'):
+        merged['apply_update_command'] = str(applyability['update_command'])
+    if applyability.get('spawn_mode'):
+        merged['apply_spawn_mode'] = str(applyability['spawn_mode'])
+    if applyability.get('spawn_command'):
+        merged['apply_spawn_command'] = list(applyability['spawn_command'])
+    if applyability.get('branch'):
+        merged['local_branch'] = str(applyability['branch'])
+    if applyability.get('target_branch'):
+        merged['local_target_branch'] = str(applyability['target_branch'])
+    if 'ahead' in applyability:
+        merged['local_ahead'] = applyability.get('ahead')
+    if 'behind' in applyability:
+        merged['local_behind'] = applyability.get('behind')
+    if 'dirty' in applyability:
+        merged['local_dirty'] = bool(applyability.get('dirty'))
+    if 'dirty_entries' in applyability:
+        merged['local_dirty_entries'] = applyability.get('dirty_entries')
+    return merged
+
+
 def cached_update_status(*, include_agent=True, channel=None):
     """Return cached update status without performing network or git mutations."""
     include_agent = bool(include_agent)
@@ -1163,12 +1340,15 @@ def check_for_updates(force=False, *, include_agent=True, channel=None):
     try:
         # Run checks outside the lock (network I/O)
         webui_info = _check_repo(REPO_ROOT, 'webui', channel)
+        webui_info = _merge_applyability_info(webui_info, _webui_update_applyability_info())
         # The update channel is a WebUI-only concept. The Agent is a separate
         # project that tags plain v* and legitimately tracks master past its
         # tags; it must ALWAYS use the default channel regardless of the user's
-        # WebUI channel selection. (Codex gate: passing 'experimental' here made
-        # the Agent ignore its v* tags and fall back to origin/master.)
+        # WebUI channel selection. (Passing 'experimental' here makes the Agent
+        # ignore its v* tags and fall back to origin/main.)
         agent_info = _check_repo(_AGENT_DIR, 'agent', DEFAULT_UPDATE_CHANNEL) if include_agent else _ignored_agent_update_info()
+        if include_agent:
+            agent_info = _merge_applyability_info(agent_info, _agent_update_applyability_info())
 
         with _cache_lock:
             _update_cache['webui'] = webui_info
@@ -1661,6 +1841,49 @@ def _agent_gateway_restart_failure_message(target: str, restart_result: dict) ->
     )
 
 
+def _apply_external_update(target: str, path: Path, applyability: dict) -> dict:
+    """Apply repo updates via an external updater contract."""
+    command = applyability.get('spawn_command')
+    if not isinstance(command, list) or not command:
+        return {
+            'ok': False,
+            'message': f'{target.capitalize()} update is marked external, but no updater command was provided.',
+        }
+    detail, ok = _run_external_update_command(command, cwd=path)
+    if not ok:
+        sanitized = _sanitize_git_diagnostic(detail)
+        return {
+            'ok': False,
+            'message': f'Update failed ({target}): {sanitized or "external updater failed"}',
+        }
+
+    with _cache_lock:
+        _update_cache['checked_at'] = 0
+
+    response = {
+        'ok': True,
+        'target': target,
+        'restart_scheduled': True,
+        'update_command': applyability.get('update_command'),
+    }
+    if target == 'agent':
+        gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
+        if not gateway_ok:
+            return {
+                'ok': False,
+                'message': _agent_gateway_restart_failure_message(target, gateway_result),
+                'target': target,
+                'gateway_restart': gateway_result.get('status'),
+            }
+        response['gateway_restart'] = gateway_result.get('status')
+        response['message'] = 'agent updated successfully via the local/live carry workflow'
+    else:
+        response['message'] = 'webui updated successfully via the local carry workflow'
+
+    _schedule_restart()
+    return response
+
+
 def apply_force_update(target: str, channel=None) -> dict:
     """Force-reset the target repo to the latest remote HEAD.
 
@@ -1784,6 +2007,7 @@ def apply_force_update(target: str, channel=None) -> dict:
         with _cache_lock:
             _update_cache['checked_at'] = 0
 
+        gateway_result = None
         if target == 'agent':
             gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
             if not gateway_ok:
@@ -1877,6 +2101,18 @@ def _apply_update_inner(target, channel=DEFAULT_UPDATE_CHANNEL):
     if path is None or not (path / '.git').exists():
         return {'ok': False, 'message': 'Not a git repository'}
 
+    applyability = None
+    if target == 'agent':
+        applyability = _agent_update_applyability_info()
+        if (
+            isinstance(applyability, dict)
+            and applyability.get('can_apply')
+            and applyability.get('spawn_mode') == 'external'
+            and applyability.get('spawn_command')
+            and applyability.get('reason') == 'local_live_update'
+        ):
+            return _apply_external_update(target, path, applyability)
+
     # Fetch before attempting pull, so the remote ref is current.
     # --force so a remote re-tag doesn't block the update path (see #2756).
     fetch_out, fetch_ok = _run_git(['fetch', 'origin', '--quiet', '--tags', '--force'], path, timeout=15)
@@ -1894,6 +2130,17 @@ def _apply_update_inner(target, channel=DEFAULT_UPDATE_CHANNEL):
                 'Could not reach the remote repository. Check your internet connection and try again.',
             ),
         }
+
+    if target == 'webui':
+        applyability = _webui_update_applyability_info()
+        if (
+            isinstance(applyability, dict)
+            and applyability.get('can_apply')
+            and applyability.get('spawn_mode') == 'external'
+            and applyability.get('spawn_command')
+            and applyability.get('reason') == 'local_carry_rebase'
+        ):
+            return _apply_external_update(target, path, applyability)
 
     compare_ref = _select_apply_compare_ref(path, channel, target)
     # On the stable channel a None ref means HEAD already contains the latest
@@ -2098,6 +2345,7 @@ def _apply_update_inner(target, channel=DEFAULT_UPDATE_CHANNEL):
             with _cache_lock:
                 _update_cache['checked_at'] = 0
 
+            gateway_result = None
             if target == 'agent':
                 gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
                 if not gateway_ok:
@@ -2130,6 +2378,7 @@ def _apply_update_inner(target, channel=DEFAULT_UPDATE_CHANNEL):
     with _cache_lock:
         _update_cache['checked_at'] = 0
 
+    gateway_result = None
     if target == 'agent':
         gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
         if not gateway_ok:

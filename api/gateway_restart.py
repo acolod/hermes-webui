@@ -29,6 +29,38 @@ def _resolve_hermes_command() -> str:
     return "hermes"
 
 
+def _gateway_service_name() -> str:
+    return os.getenv("HERMES_GATEWAY_SERVICE_NAME", "hermes-gateway.service")
+
+
+def _system_gateway_is_active() -> bool:
+    """Return True when the system-scoped gateway service is active."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-active", _gateway_service_name()],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0 and (proc.stdout or "").strip() == "active"
+
+
+def _restart_command_for_active_scope(hermes_cmd: str) -> tuple[list[str], dict[str, str], str]:
+    """Choose the gateway restart command for the currently active service scope."""
+    active_home = get_active_hermes_home()
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(active_home)
+
+    if _system_gateway_is_active():
+        return ["sudo", "-n", hermes_cmd, "gateway", "restart", "--system"], env, "system"
+
+    return [hermes_cmd, "gateway", "restart"], env, "user"
+
+
 def _consume_stream(stream) -> None:
     """Drain a subprocess stream to prevent stdout/stderr pipe deadlocks."""
     try:
@@ -42,7 +74,6 @@ def _release_lock() -> None:
     try:
         _GATEWAY_RESTART_LOCK.release()
     except RuntimeError:
-        # The lock may already have been released by another path.
         pass
 
 
@@ -51,14 +82,7 @@ def restart_active_profile_gateway(
     quick_timeout_seconds: float = 2.0,
     background_wait_seconds: float = 240.0,
 ) -> dict:
-    """Run a non-blocking ``hermes gateway restart`` for the active profile.
-
-    Returns a short status dict with these values:
-    - completed: command finished quickly and succeeded.
-    - in_progress: command did not finish within ``quick_timeout_seconds``.
-    - failed: command finished quickly with non-zero exit status.
-    - busy: restart already in progress from another caller.
-    """
+    """Run a non-blocking gateway restart for the active profile/service scope."""
     if not _GATEWAY_RESTART_LOCK.acquire(blocking=False):
         return {
             "status": "busy",
@@ -66,18 +90,17 @@ def restart_active_profile_gateway(
         }
 
     try:
-        active_home = get_active_hermes_home()
-        env = os.environ.copy()
-        env["HERMES_HOME"] = str(active_home)
         hermes_cmd = _resolve_hermes_command()
+        command, env, scope = _restart_command_for_active_scope(hermes_cmd)
 
         logger.info(
-            "Restarting gateway service via CLI command: %s gateway restart (HERMES_HOME=%s)",
-            hermes_cmd,
-            active_home,
+            "Restarting %s gateway service via CLI command: %s (HERMES_HOME=%s)",
+            scope,
+            " ".join(command),
+            env.get("HERMES_HOME"),
         )
         proc = subprocess.Popen(
-            [hermes_cmd, "gateway", "restart"],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -95,6 +118,7 @@ def restart_active_profile_gateway(
                     "status": "completed",
                     "message": "Gateway service restarted successfully",
                     "detail": stdout or stderr,
+                    "scope": scope,
                 }
 
             logger.error("Gateway service restart failed with code %s: %s", proc.returncode, stderr)
@@ -103,12 +127,12 @@ def restart_active_profile_gateway(
                 "message": f"Restart failed: {stderr or stdout}",
                 "detail": stdout or stderr,
                 "returncode": proc.returncode,
+                "scope": scope,
             }
 
         except subprocess.TimeoutExpired:
             logger.info(
-                "Gateway restart is taking longer than %.1fs (likely draining in-flight runs);"
-                " continuing in background",
+                "Gateway restart is taking longer than %.1fs (likely draining in-flight runs); continuing in background",
                 quick_timeout_seconds,
             )
 
@@ -132,9 +156,7 @@ def restart_active_profile_gateway(
                             try:
                                 proc.wait(timeout=5.0)
                             except subprocess.TimeoutExpired:
-                                logger.error(
-                                    "Gateway restart process refused to die even after SIGKILL.",
-                                )
+                                logger.error("Gateway restart process refused to die even after SIGKILL.")
                     except Exception:
                         logger.exception("Failed to terminate timed out gateway restart process.")
                 finally:
@@ -144,6 +166,7 @@ def restart_active_profile_gateway(
             return {
                 "status": "in_progress",
                 "message": "Gateway service restart initiated (in progress)",
+                "scope": scope,
             }
     except Exception as exc:
         _release_lock()

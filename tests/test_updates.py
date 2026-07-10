@@ -290,6 +290,203 @@ def test_update_cache_is_scoped_by_agent_inclusion(tmp_path):
     assert calls == ['webui', 'webui', 'agent']
 
 
+def test_check_for_updates_includes_agent_applyability_metadata(tmp_path):
+    """Agent update checks should surface additive applyability metadata from Hermes."""
+    webui_path = tmp_path / 'webui'
+    agent_path = tmp_path / 'agent'
+    webui_path.mkdir()
+    agent_path.mkdir()
+
+    def fake_check_repo(path, name, channel='stable'):
+        return {'name': name, 'behind': 2 if name == 'webui' else 17, 'branch': 'origin/main'}
+
+    applyability = {
+        'can_apply': True,
+        'reason': 'local_live_update',
+        'message': 'Use hermes-local-update.',
+        'update_command': 'hermes-local-update',
+        'spawn_mode': 'external',
+        'spawn_command': ['/home/alex/.local/bin/hermes-local-update'],
+        'branch': 'local/live',
+        'target_branch': 'main',
+        'ahead': 17,
+        'dirty': False,
+        'dirty_entries': 0,
+    }
+
+    with patch.dict(updates._update_cache, {'webui': None, 'agent': None, 'checked_at': 0, 'include_agent': True}, clear=True), \
+         patch.object(updates, 'REPO_ROOT', webui_path), \
+         patch.object(updates, '_AGENT_DIR', agent_path), \
+         patch.object(updates, '_check_repo', side_effect=fake_check_repo), \
+         patch.object(updates, '_agent_update_applyability_info', return_value=applyability):
+        result = updates.check_for_updates(force=True, include_agent=True)
+
+    assert result['agent']['behind'] == 17
+    assert result['agent']['branch'] == 'origin/main'
+    assert result['agent']['can_apply'] is True
+    assert result['agent']['apply_reason'] == 'local_live_update'
+    assert result['agent']['apply_message'] == 'Use hermes-local-update.'
+    assert result['agent']['apply_update_command'] == 'hermes-local-update'
+    assert result['agent']['apply_spawn_mode'] == 'external'
+    assert result['agent']['apply_spawn_command'] == ['/home/alex/.local/bin/hermes-local-update']
+    assert result['agent']['local_branch'] == 'local/live'
+    assert result['agent']['local_target_branch'] == 'main'
+    assert result['agent']['local_ahead'] == 17
+    assert result['agent']['local_dirty'] is False
+    assert result['agent']['local_dirty_entries'] == 0
+
+
+def test_check_for_updates_includes_webui_local_carry_metadata(tmp_path):
+    """WebUI update checks should surface local-carry applyability when ahead of upstream."""
+    (tmp_path / '.git').mkdir()
+
+    with patch.dict(updates._update_cache, {'webui': None, 'agent': None, 'checked_at': 0, 'include_agent': False}, clear=True), \
+         patch.object(updates, 'REPO_ROOT', tmp_path), \
+         patch.object(updates, '_check_repo', return_value={'name': 'webui', 'behind': 12, 'branch': 'origin/master'}), \
+         patch.object(updates, '_webui_update_applyability_info', return_value={
+             'can_apply': True,
+             'reason': 'local_carry_rebase',
+             'message': 'Use hermes-webui-local-update.',
+             'update_command': 'hermes-webui-local-update',
+             'spawn_mode': 'external',
+             'spawn_command': ['/home/alex/.local/bin/hermes-webui-local-update'],
+             'branch': 'master',
+             'target_branch': 'master',
+             'ahead': 1,
+             'behind': 12,
+             'dirty': False,
+             'dirty_entries': 0,
+         }):
+        result = updates.check_for_updates(force=True, include_agent=False)
+
+    assert result['webui']['behind'] == 12
+    assert result['webui']['can_apply'] is True
+    assert result['webui']['apply_reason'] == 'local_carry_rebase'
+    assert result['webui']['apply_message'] == 'Use hermes-webui-local-update.'
+    assert result['webui']['apply_update_command'] == 'hermes-webui-local-update'
+    assert result['webui']['apply_spawn_mode'] == 'external'
+    assert result['webui']['apply_spawn_command'] == ['/home/alex/.local/bin/hermes-webui-local-update']
+    assert result['webui']['local_branch'] == 'master'
+    assert result['webui']['local_target_branch'] == 'master'
+    assert result['webui']['local_ahead'] == 1
+    assert result['webui']['local_behind'] == 12
+    assert result['webui']['local_dirty'] is False
+    assert result['webui']['local_dirty_entries'] == 0
+
+
+
+def test_apply_update_uses_local_carry_wrapper_for_webui(tmp_path):
+    """WebUI updates with local carry commits should call the external rebase wrapper."""
+    (tmp_path / '.git').mkdir()
+    applyability = {
+        'can_apply': True,
+        'reason': 'local_carry_rebase',
+        'update_command': 'hermes-webui-local-update',
+        'spawn_mode': 'external',
+        'spawn_command': ['/home/alex/.local/bin/hermes-webui-local-update'],
+    }
+
+    with patch.object(updates, 'REPO_ROOT', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}), \
+         patch.object(updates, '_webui_update_applyability_info', return_value=applyability), \
+         patch.object(updates, '_run_external_update_command', return_value=('ok', True)) as run_external, \
+         patch.object(updates, '_schedule_restart') as schedule_restart, \
+         patch.object(updates, '_run_git', return_value=('', True)):
+        result = updates.apply_update('webui')
+
+    run_external.assert_called_once_with(['/home/alex/.local/bin/hermes-webui-local-update'], cwd=tmp_path)
+    schedule_restart.assert_called_once_with()
+    assert result == {
+        'ok': True,
+        'message': 'webui updated successfully via the local carry workflow',
+        'target': 'webui',
+        'restart_scheduled': True,
+        'update_command': 'hermes-webui-local-update',
+    }
+
+
+
+def test_apply_update_reports_external_webui_wrapper_failure(tmp_path):
+    """When the WebUI local-carry updater fails, surface that failure cleanly."""
+    (tmp_path / '.git').mkdir()
+    applyability = {
+        'can_apply': True,
+        'reason': 'local_carry_rebase',
+        'update_command': 'hermes-webui-local-update',
+        'spawn_mode': 'external',
+        'spawn_command': ['/home/alex/.local/bin/hermes-webui-local-update'],
+    }
+
+    with patch.object(updates, 'REPO_ROOT', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}), \
+         patch.object(updates, '_webui_update_applyability_info', return_value=applyability), \
+         patch.object(updates, '_run_external_update_command', return_value=('ERROR: rebase conflict while replaying local carries', False)), \
+         patch.object(updates, '_run_git', return_value=('', True)):
+        result = updates.apply_update('webui')
+
+    assert result == {
+        'ok': False,
+        'message': 'Update failed (webui): ERROR: rebase conflict while replaying local carries',
+    }
+
+
+
+def test_apply_update_uses_local_live_wrapper_for_agent(tmp_path):
+    """Agent updates should call the external local/live wrapper instead of git pull."""
+    (tmp_path / '.git').mkdir()
+    applyability = {
+        'can_apply': True,
+        'reason': 'local_live_update',
+        'update_command': 'hermes-local-update',
+        'spawn_mode': 'external',
+        'spawn_command': ['/home/alex/.local/bin/hermes-local-update'],
+    }
+
+    with patch.object(updates, '_AGENT_DIR', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}), \
+         patch.object(updates, '_agent_update_applyability_info', return_value=applyability), \
+         patch.object(updates, '_run_external_update_command', return_value=('ok', True)) as run_external, \
+         patch.object(updates, '_ensure_gateway_restart_for_agent_update', return_value=(True, {'status': 'completed'})), \
+         patch.object(updates, '_schedule_restart') as schedule_restart, \
+         patch.object(updates, '_run_git', side_effect=AssertionError('plain git path should not be used for local/live agent updates')):
+        result = updates.apply_update('agent')
+
+    run_external.assert_called_once_with(['/home/alex/.local/bin/hermes-local-update'], cwd=tmp_path)
+    schedule_restart.assert_called_once_with()
+    assert result == {
+        'ok': True,
+        'message': 'agent updated successfully via the local/live carry workflow',
+        'target': 'agent',
+        'restart_scheduled': True,
+        'gateway_restart': 'completed',
+        'update_command': 'hermes-local-update',
+    }
+
+
+def test_apply_update_reports_external_agent_wrapper_failure(tmp_path):
+    """When the local/live updater fails, surface that failure instead of a git diverged hint."""
+    (tmp_path / '.git').mkdir()
+    applyability = {
+        'can_apply': True,
+        'reason': 'local_live_update',
+        'update_command': 'hermes-local-update',
+        'spawn_mode': 'external',
+        'spawn_command': ['/home/alex/.local/bin/hermes-local-update'],
+    }
+
+    with patch.object(updates, '_AGENT_DIR', tmp_path), \
+         patch.object(updates, '_restart_blocker_snapshot', return_value={'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}), \
+         patch.object(updates, '_agent_update_applyability_info', return_value=applyability), \
+         patch.object(updates, '_run_external_update_command', return_value=('ERROR: Runtime checkout is dirty on branch local/live', False)), \
+         patch.object(updates, '_run_git', side_effect=AssertionError('plain git path should not be used for local/live agent updates')):
+        result = updates.apply_update('agent')
+
+    assert result == {
+        'ok': False,
+        'message': 'Update failed (agent): ERROR: Runtime checkout is dirty on branch local/live',
+    }
+
+
 def test_run_git_returns_stderr_on_failure(tmp_path):
     """When a git command fails, _run_git should return stderr (not empty string)."""
     with patch.object(updates.shutil, 'which', return_value='C:/Tools/git.exe'), \
@@ -969,6 +1166,7 @@ def test_apply_update_status_lock_error_returns_lock_conflict(tmp_path):
     from api import updates as mod
     with patch(f'{_MODULE}.REPO_ROOT', tmp_path), \
          patch(f'{_MODULE}._select_apply_compare_ref', return_value='origin/main'), \
+         patch(f'{_MODULE}._webui_update_applyability_info', return_value=None), \
          patch(f'{_MODULE}._run_git') as mock_run_git:
         mock_run_git.side_effect = [
             ('', True),   # fetch succeeds

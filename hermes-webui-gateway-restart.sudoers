@@ -1,0 +1,1 @@
+alex ALL=(root) NOPASSWD: /home/alex/.local/bin/hermes gateway restart --system
