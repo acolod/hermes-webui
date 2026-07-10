@@ -616,6 +616,7 @@ The WebUI is still coupled to Hermes Agent internals for runtime execution, prov
 **Deploying & operating**
 - [`docs/remote-access.md`](docs/remote-access.md) — SSH tunnel, Tailscale, and phone access (incl. a community ARM64-Android field report)
 - [`docs/advanced-chat-setup.md`](docs/advanced-chat-setup.md) — optional dynamic recall-prefill and Gateway-backed browser chat for self-hosted deployments
+- [`LOCAL_CARRY_NOTES.md`](LOCAL_CARRY_NOTES.md) — local-carry update workflow, wrapper scripts, and the exact files to inspect when update/apply/restart behavior breaks
 - [`docs/docker.md`](docs/docker.md) — Docker compose setup, common failures, and bind-mount migration
 - [`docs/supervisor.md`](docs/supervisor.md) — launchd, systemd, supervisord, runit, and s6 process-supervisor setup
 - [`docs/wsl-autostart.md`](docs/wsl-autostart.md) — WSL2 auto-start at Windows login

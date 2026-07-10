@@ -198,6 +198,9 @@ does not match the touched subsystem.
   bind-mount migration.
 - [`docs/troubleshooting.md`](troubleshooting.md): diagnostic flows for common
   failures.
+- [`../LOCAL_CARRY_NOTES.md`](../LOCAL_CARRY_NOTES.md): local-carry update
+  workflow, wrapper routing, restart-scope notes, and the live file/command map
+  for diagnosing WebUI or Agent update failures.
 - [`docs/EXTENSIONS.md`](EXTENSIONS.md): administrator-controlled WebUI
   extension injection.
 

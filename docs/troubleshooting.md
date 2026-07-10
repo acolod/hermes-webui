@@ -177,6 +177,89 @@ turn in the exhausted session instead of being blocked with recovery guidance.
 
 ---
 
+## WebUI says update failed (agent or webui)
+
+**Symptom.** The WebUI update panel reports an update failure for either:
+
+- **WebUI** itself, or
+- **Agent**, often with language about local commits, fast-forward-only updates,
+  rebase failure, restart failure, or a git lock file.
+
+**Why.** This installation intentionally supports **local carry** workflows:
+
+- Hermes WebUI can carry local commits on top of `origin/master`
+- Hermes Agent can run from `local/live`, which is intentionally ahead of `main`
+
+So not every "ahead of remote" state is a bug. The important question is
+whether the correct updater wrapper ran:
+
+- WebUI local carries → `hermes-webui-local-update`
+- Agent local/live carries → `hermes-local-update`
+
+**Diagnostic.**
+
+1. Check the WebUI carry runbook first:
+   ```bash
+   cd ~/hermes-webui
+   sed -n '1,220p' LOCAL_CARRY_NOTES.md
+   ```
+2. Inspect the current WebUI carry state:
+   ```bash
+   cd ~/hermes-webui
+   ~/.local/bin/hermes-webui-local-update --check
+   git log --oneline origin/master..HEAD
+   ```
+3. Inspect the current Agent carry state:
+   ```bash
+   ~/.local/bin/hermes-local-update --check
+   git -C ~/.hermes/hermes-agent log --oneline main..local/live
+   ```
+4. If the failure sounds like a routing bug, inspect the live source-of-truth
+   files named in `LOCAL_CARRY_NOTES.md`, especially:
+   - `api/updates.py`
+   - `api/gateway_restart.py`
+   - `api/routes.py`
+   - `static/ui.js`
+   - `tests/test_updates.py`
+   - `tests/test_gateway_restart_helper.py`
+
+**How to classify the failure.**
+
+1. **Wrong updater path**
+   - Symptom: a local-carry checkout is treated as generic divergence or a plain
+     fast-forward-only update path runs.
+   - Check: `api/updates.py`, `api/routes.py`, `static/ui.js`.
+2. **Stale carry commit / replay conflict**
+   - Symptom: the wrapper ran, but rebase/cherry-pick failed replaying a local
+     customization onto new upstream.
+   - Check: `git log ...`, backup branches, and `LOCAL_CARRY_NOTES.md`.
+3. **Restart-only failure**
+   - Symptom: repo update succeeded, but the UI still reports failure because
+     gateway restart did not complete.
+   - Check: `api/gateway_restart.py` and service scope (`systemctl` vs
+     `systemctl --user`).
+4. **Lock-file failure**
+   - Symptom: `.git/index.lock` or similar blocks the update.
+   - Check: `api/updates.py` lock-recovery response and the exact manual command
+     returned by the API.
+5. **Force-update decision**
+   - Symptom: the user wants to discard local carries instead of preserving
+     them.
+   - Check: `/api/updates/force` behavior; this is intentionally destructive.
+
+**Fix.** Use the wrapper-based path first. Do **not** jump straight to a hard
+reset unless you intend to discard local changes. If the wrapper itself fails,
+refresh the stale carry commit as a new commit on current upstream, then update
+`LOCAL_CARRY_NOTES.md`.
+
+**When to file a bug.** File a bug if:
+
+- the normal WebUI update button bypasses the wrapper for a local-carry repo,
+- the repo update succeeds but the UI misreports the phase that actually failed,
+- or the documented source-of-truth files no longer match the live code path.
+
+---
+
 ## Other troubleshooting
 
 This document grows over time. If a recurring failure mode isn't covered here yet, add it via PR. The format for each entry: **Symptom → Why → Diagnostic commands → Fix → When to file a bug**.
