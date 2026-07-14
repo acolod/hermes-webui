@@ -1,11 +1,497 @@
 """Tests for self-update diagnostics (api/updates.py)."""
 import os
 import time
+from contextlib import ExitStack
+from urllib.parse import urlparse
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import api.updates as updates
+
+
+@pytest.mark.parametrize('operation', ['check', 'cached_status', 'apply', 'force_apply'])
+@pytest.mark.parametrize('channel', [[], {}], ids=['list-channel', 'dict-channel'])
+def test_malformed_channel_is_contained_without_normalization_or_side_effects(tmp_path, operation, channel):
+    """Malformed persisted/request channels cannot escape maintenance containment."""
+    repo = tmp_path / 'managed'
+    repo.mkdir()
+    mocks = {}
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': repo, 'agent': repo}))
+        stack.enter_context(patch.object(updates, 'REPO_ROOT', repo))
+        stack.enter_context(patch.object(updates, '_AGENT_DIR', repo))
+        for name in (
+            '_read_update_channel', '_normalize_channel', '_restart_blocker_snapshot',
+            '_check_repo', '_run_git', '_webui_update_applyability_info',
+            '_agent_update_applyability_info', '_schedule_restart',
+            '_ensure_gateway_restart_for_agent_update',
+        ):
+            mocks[name] = stack.enter_context(patch.object(updates, name))
+
+        if operation == 'check':
+            result = updates.check_for_updates(force=True, include_agent=True, channel=channel)
+            payloads = [result['webui'], result['agent']]
+            assert result['channel'] == updates.DEFAULT_UPDATE_CHANNEL
+        elif operation == 'cached_status':
+            result = updates.cached_update_status(include_agent=True, channel=channel)
+            payloads = [result['webui'], result['agent']]
+            assert result['channel'] == updates.DEFAULT_UPDATE_CHANNEL
+        elif operation == 'apply':
+            result = updates.apply_update('webui', channel=channel)
+            payloads = [result]
+        else:
+            result = updates.apply_force_update('webui', channel=channel)
+            payloads = [result]
+
+    for payload in payloads:
+        assert payload['reason'] == 'managed_update_maintenance'
+        assert payload['can_apply'] is False
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+@pytest.mark.parametrize('branch', ['master', 'local/live', 'feature/phase-0-2'])
+def test_maintenance_check_contains_both_canonical_targets_without_git_or_branch_probe(tmp_path, branch):
+    """Managed checkouts stay contained regardless of the WebUI branch name."""
+    agent = tmp_path / 'hermes-agent'
+    webui = tmp_path / 'local-live'
+    agent.mkdir()
+    webui.mkdir()
+    (webui / '.git').mkdir()
+    (webui / '.git' / 'HEAD').write_text(f'ref: refs/heads/{branch}\n')
+    check_repo = MagicMock(name='_check_repo')
+    run_git = MagicMock(name='_run_git')
+    webui_probe = MagicMock(name='_webui_update_applyability_info')
+    agent_probe = MagicMock(name='_agent_update_applyability_info')
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {
+        'agent': agent.resolve(),
+        'webui': webui.resolve(),
+    }), patch.object(updates, 'REPO_ROOT', webui), \
+         patch.object(updates, '_AGENT_DIR', agent), \
+         patch.dict(updates._update_cache, {
+             'webui': None, 'agent': None, 'checked_at': 0,
+             'include_agent': True, 'channel': 'stable',
+         }, clear=True), \
+         patch.object(updates, '_check_repo', check_repo), \
+         patch.object(updates, '_run_git', run_git), \
+         patch.object(updates, '_webui_update_applyability_info', webui_probe), \
+         patch.object(updates, '_agent_update_applyability_info', agent_probe):
+        result = updates.check_for_updates(force=True, include_agent=True, channel='stable')
+
+    check_repo.assert_not_called()
+    run_git.assert_not_called()
+    webui_probe.assert_not_called()
+    agent_probe.assert_not_called()
+    for target in ('webui', 'agent'):
+        assert result[target]['reason'] == 'managed_update_maintenance'
+        assert result[target]['apply_reason'] == 'managed_update_maintenance'
+        assert result[target]['can_apply'] is False
+
+
+@pytest.mark.parametrize('target', ['webui', 'agent'])
+def test_maintenance_guard_refuses_apply_for_both_canonical_targets(tmp_path, target):
+    repo = tmp_path / target
+    repo.mkdir()
+    (repo / '.git').mkdir()
+    webui_probe = MagicMock(name='_webui_update_applyability_info')
+    agent_probe = MagicMock(name='_agent_update_applyability_info')
+    run_git = MagicMock(name='_run_git')
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {target: repo.resolve()}), \
+         patch.object(updates, 'REPO_ROOT', repo), \
+         patch.object(updates, '_AGENT_DIR', repo), \
+         patch.object(updates, '_run_git', run_git), \
+         patch.object(updates, '_webui_update_applyability_info', webui_probe), \
+         patch.object(updates, '_agent_update_applyability_info', agent_probe):
+        result = updates.apply_update(target)
+
+    run_git.assert_not_called()
+    webui_probe.assert_not_called()
+    agent_probe.assert_not_called()
+    assert result['ok'] is False
+    assert result['reason'] == 'managed_update_maintenance'
+    assert result['can_apply'] is False
+
+
+@pytest.mark.parametrize('target', ['webui', 'agent'])
+def test_maintenance_guard_refuses_force_update_for_both_canonical_targets(tmp_path, target):
+    repo = tmp_path / target
+    repo.mkdir()
+    (repo / '.git').mkdir()
+    webui_probe = MagicMock(name='_webui_update_applyability_info')
+    agent_probe = MagicMock(name='_agent_update_applyability_info')
+    run_git = MagicMock(name='_run_git')
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {target: repo.resolve()}), \
+         patch.object(updates, 'REPO_ROOT', repo), \
+         patch.object(updates, '_AGENT_DIR', repo), \
+         patch.object(updates, '_run_git', run_git), \
+         patch.object(updates, '_webui_update_applyability_info', webui_probe), \
+         patch.object(updates, '_agent_update_applyability_info', agent_probe):
+        result = updates.apply_force_update(target)
+
+    run_git.assert_not_called()
+    webui_probe.assert_not_called()
+    agent_probe.assert_not_called()
+    assert result['ok'] is False
+    assert result['reason'] == 'managed_update_maintenance'
+    assert result['can_apply'] is False
+
+
+def test_agent_probe_failure_cannot_reach_stock_git_pull_under_maintenance(tmp_path):
+    agent = tmp_path / 'hermes-agent'
+    agent.mkdir()
+    (agent / '.git').mkdir()
+    agent_probe = MagicMock(name='_agent_update_applyability_info')
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'agent': agent.resolve()}), \
+         patch.object(updates, '_AGENT_DIR', agent), \
+         patch.object(updates, '_agent_update_applyability_info', agent_probe), \
+         patch.object(updates, '_run_git', side_effect=AssertionError('stock git pull must not run')):
+        result = updates.apply_update('agent')
+
+    assert result['ok'] is False
+    assert result['reason'] == 'managed_update_maintenance'
+    agent_probe.assert_not_called()
+
+
+def test_maintenance_guard_refuses_canonical_path_replaced_by_different_symlink(tmp_path):
+    canonical = tmp_path / 'managed'
+    replacement = tmp_path / 'replacement'
+    canonical.mkdir()
+    replacement.mkdir()
+    canonical.rmdir()
+    canonical.symlink_to(replacement, target_is_directory=True)
+
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': canonical}), \
+         patch.object(updates, 'REPO_ROOT', canonical), \
+         patch.object(updates, '_check_repo') as check_repo, \
+         patch.object(updates, '_run_git') as run_git, \
+         patch.object(updates, '_webui_update_applyability_info') as webui_probe:
+        result = updates.check_for_updates(force=True, include_agent=False, channel='stable')
+
+    assert result['webui']['reason'] == 'managed_update_maintenance'
+    check_repo.assert_not_called()
+    run_git.assert_not_called()
+    webui_probe.assert_not_called()
+
+
+def test_maintenance_guard_refuses_canonical_symlink_loop_without_fallback(tmp_path):
+    canonical = tmp_path / 'managed'
+    canonical.symlink_to(canonical, target_is_directory=True)
+
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': canonical}), \
+         patch.object(updates, 'REPO_ROOT', canonical), \
+         patch.object(updates, '_check_repo') as check_repo:
+        result = updates.check_for_updates(force=True, include_agent=False, channel='stable')
+
+    assert result['webui']['reason'] == 'managed_update_maintenance'
+    check_repo.assert_not_called()
+
+
+def test_maintenance_guard_refuses_alias_resolving_to_canonical_identity(tmp_path):
+    canonical = tmp_path / 'managed'
+    alias = tmp_path / 'alias'
+    canonical.mkdir()
+    alias.symlink_to(canonical, target_is_directory=True)
+
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': canonical}):
+        result = updates._maintenance_guard_response('webui', alias, operation='check')
+
+    assert result is not None
+    assert result['reason'] == 'managed_update_maintenance'
+
+
+def test_maintenance_guard_leaves_normally_resolving_unrelated_path_uncontained(tmp_path):
+    canonical = tmp_path / 'managed'
+    unrelated = tmp_path / 'unrelated'
+    canonical.mkdir()
+    unrelated.mkdir()
+
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': canonical}):
+        result = updates._maintenance_guard_response('webui', unrelated, operation='check')
+
+    assert result is None
+
+
+def test_maintenance_guard_path_resolution_failure_is_explicit_refusal(tmp_path):
+    canonical = tmp_path / 'managed'
+    unrelated = tmp_path / 'unrelated'
+    canonical.mkdir()
+    unrelated.mkdir()
+
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': canonical}), \
+         patch.object(updates.Path, 'resolve', side_effect=OSError('resolution failed')):
+        result = updates._maintenance_guard_response('webui', unrelated, operation='check')
+
+    assert result is not None
+    assert result['reason'] == 'managed_update_maintenance'
+
+
+def test_maintenance_guard_configured_target_with_unavailable_path_fails_closed():
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': '/managed/webui'}):
+        result = updates._maintenance_guard_response('webui', None, operation='check')
+
+    assert result is not None
+    assert result['reason'] == 'managed_update_maintenance'
+    assert result['can_apply'] is False
+
+
+def test_maintenance_guard_unknown_target_with_unavailable_path_stays_unconfigured():
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {}):
+        result = updates._maintenance_guard_response('unknown', None, operation='check')
+
+    assert result is None
+
+
+@pytest.mark.parametrize('target,path_name', [('webui', 'REPO_ROOT'), ('agent', '_AGENT_DIR')])
+@pytest.mark.parametrize(
+    'apply_fn,operation',
+    [
+        (updates.apply_update, 'apply'),
+        (updates.apply_force_update, 'force'),
+        (updates.apply_clear_lock, 'clear_lock'),
+    ],
+)
+def test_configured_target_with_none_path_refuses_every_apply_surface(
+    target, path_name, apply_fn, operation,
+):
+    mocks = {}
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {target: '/managed/' + target}))
+        stack.enter_context(patch.object(updates, path_name, None))
+        for name in (
+            '_read_update_channel', '_normalize_channel', '_restart_blocker_snapshot',
+            '_inventory_locks', '_apply_update_inner', '_run_git',
+            '_webui_update_applyability_info', '_agent_update_applyability_info',
+            '_schedule_restart', '_ensure_gateway_restart_for_agent_update',
+        ):
+            mocks[name] = stack.enter_context(patch.object(updates, name))
+        result = apply_fn(target)
+
+    assert result['reason'] == 'managed_update_maintenance'
+    assert result['operation'] == operation
+    assert result['can_apply'] is False
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+@pytest.mark.parametrize('include_agent', [True, False])
+@pytest.mark.parametrize('status_fn', [updates.check_for_updates, updates.cached_update_status])
+def test_status_surfaces_fail_closed_for_configured_none_paths_without_cache_or_probes(
+    include_agent, status_fn,
+):
+    cache = {
+        'webui': {'name': 'webui', 'behind': 4, 'can_apply': True},
+        'agent': {'name': 'agent', 'behind': 2, 'can_apply': True},
+        'checked_at': time.time(), 'include_agent': True, 'channel': 'stable',
+    }
+    mocks = {}
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {
+            'webui': '/managed/webui', 'agent': '/managed/agent',
+        }))
+        stack.enter_context(patch.object(updates, 'REPO_ROOT', None))
+        stack.enter_context(patch.object(updates, '_AGENT_DIR', None))
+        stack.enter_context(patch.dict(updates._update_cache, cache, clear=True))
+        for name in (
+            '_read_update_channel', '_normalize_channel', '_check_repo', '_run_git',
+            '_webui_update_applyability_info', '_agent_update_applyability_info',
+            '_restart_blocker_snapshot',
+        ):
+            mocks[name] = stack.enter_context(patch.object(updates, name))
+        if status_fn is updates.check_for_updates:
+            result = status_fn(force=True, include_agent=include_agent, channel='stable')
+        else:
+            result = status_fn(include_agent=include_agent, channel='stable')
+
+    assert result['webui']['reason'] == 'managed_update_maintenance'
+    assert result['webui']['can_apply'] is False
+    if include_agent:
+        assert result['agent']['reason'] == 'managed_update_maintenance'
+        assert result['agent']['can_apply'] is False
+    else:
+        assert result['agent'] == updates._ignored_agent_update_info()
+    for mock in mocks.values():
+        mock.assert_not_called()
+
+
+@pytest.mark.parametrize('apply_fn', [updates.apply_update, updates.apply_force_update])
+def test_maintenance_apply_guards_before_channel_or_all_probes(tmp_path, apply_fn):
+    repo = tmp_path / 'managed'
+    repo.mkdir()
+    patchers = [
+        patch.object(updates, '_read_update_channel'),
+        patch.object(updates, '_normalize_channel'),
+        patch.object(updates, '_restart_blocker_snapshot'),
+        patch.object(updates, '_run_git'),
+        patch.object(updates, '_webui_update_applyability_info'),
+        patch.object(updates, '_agent_update_applyability_info'),
+    ]
+    with ExitStack() as stack:
+        mocks = [stack.enter_context(patcher) for patcher in patchers]
+        stack.enter_context(patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': repo}))
+        stack.enter_context(patch.object(updates, 'REPO_ROOT', repo))
+        stack.enter_context(patch.object(updates, '_AGENT_DIR', repo))
+        result = apply_fn('webui')
+
+    assert result['reason'] == 'managed_update_maintenance'
+    for mock in mocks:
+        mock.assert_not_called()
+
+
+def test_fresh_normal_cache_cannot_bypass_check_maintenance(tmp_path):
+    webui = tmp_path / 'webui'
+    agent = tmp_path / 'agent'
+    webui.mkdir()
+    agent.mkdir()
+    stale = {
+        'name': 'webui', 'behind': 4, 'can_apply': True,
+        'apply_reason': 'normal', 'apply_message': 'apply it',
+    }
+    stale_agent = {
+        'name': 'agent', 'behind': 2, 'can_apply': True,
+        'apply_reason': 'normal', 'apply_message': 'apply it',
+    }
+    cache = {
+        'webui': stale, 'agent': stale_agent, 'checked_at': time.time(),
+        'include_agent': True, 'channel': 'stable',
+    }
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {
+        'webui': webui, 'agent': agent,
+    }), patch.object(updates, 'REPO_ROOT', webui), \
+         patch.object(updates, '_AGENT_DIR', agent), \
+         patch.dict(updates._update_cache, cache, clear=True), \
+         patch.object(updates, '_read_update_channel') as read_channel, \
+         patch.object(updates, '_normalize_channel') as normalize_channel, \
+         patch.object(updates, '_check_repo') as check_repo, \
+         patch.object(updates, '_webui_update_applyability_info') as webui_probe, \
+         patch.object(updates, '_agent_update_applyability_info') as agent_probe, \
+         patch.object(updates, '_run_git') as run_git, \
+         patch.object(updates, '_restart_blocker_snapshot') as restart_probe:
+        result = updates.check_for_updates(force=False, include_agent=True)
+
+    for key in ('webui', 'agent'):
+        assert result[key]['reason'] == 'managed_update_maintenance'
+        assert result[key]['can_apply'] is False
+    assert result['checked_at'] > 0
+    assert result['include_agent'] is True
+    assert result['channel'] == 'stable'
+    read_channel.assert_not_called()
+    normalize_channel.assert_not_called()
+    for mock in (check_repo, webui_probe, agent_probe, run_git, restart_probe):
+        mock.assert_not_called()
+
+
+def test_cached_update_status_overlays_maintenance_for_both_targets_and_ignored_agent(tmp_path):
+    webui = tmp_path / 'webui'
+    agent = tmp_path / 'agent'
+    webui.mkdir()
+    agent.mkdir()
+    cache = {
+        'webui': {'name': 'webui', 'behind': 4, 'can_apply': True},
+        'agent': {'name': 'agent', 'behind': 2, 'can_apply': True},
+        'checked_at': time.time(), 'include_agent': True, 'channel': 'stable',
+    }
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {
+        'webui': webui, 'agent': agent,
+    }), patch.object(updates, 'REPO_ROOT', webui), \
+         patch.object(updates, '_AGENT_DIR', agent), \
+         patch.dict(updates._update_cache, cache, clear=True), \
+         patch.object(updates, '_read_update_channel') as read_channel, \
+         patch.object(updates, '_normalize_channel') as normalize_channel:
+        included = updates.cached_update_status(include_agent=True, channel='stable')
+        ignored = updates.cached_update_status(include_agent=False, channel='stable')
+
+    for result in (included, ignored):
+        assert result['webui']['reason'] == 'managed_update_maintenance'
+        assert result['webui']['can_apply'] is False
+    assert included['agent']['reason'] == 'managed_update_maintenance'
+    assert included['agent']['can_apply'] is False
+    assert ignored['agent'] == updates._ignored_agent_update_info()
+    read_channel.assert_not_called()
+    normalize_channel.assert_not_called()
+
+
+@pytest.mark.parametrize('operation', ['check', 'apply'])
+def test_deleted_canonical_path_is_refused_on_execution_path(tmp_path, operation):
+    canonical = tmp_path / 'managed'
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': canonical}), \
+         patch.object(updates, 'REPO_ROOT', canonical), \
+         patch.object(updates, '_read_update_channel') as read_channel, \
+         patch.object(updates, '_normalize_channel') as normalize_channel, \
+         patch.object(updates, '_check_repo') as check_repo, \
+         patch.object(updates, '_run_git') as run_git, \
+         patch.object(updates, '_webui_update_applyability_info') as webui_probe, \
+         patch.object(updates, '_restart_blocker_snapshot') as restart_probe, \
+         patch.object(updates, '_apply_update_inner') as apply_inner:
+        result = (updates.check_for_updates(force=True, include_agent=False, channel='stable')
+                  if operation == 'check' else updates.apply_update('webui', channel='stable'))
+
+    payload = result['webui'] if operation == 'check' else result
+    assert payload['reason'] == 'managed_update_maintenance'
+    for mock in (read_channel, normalize_channel, check_repo, run_git, webui_probe, restart_probe, apply_inner):
+        mock.assert_not_called()
+
+
+def test_alias_to_canonical_refuses_check_and_apply_execution_paths(tmp_path):
+    canonical = tmp_path / 'managed'
+    alias = tmp_path / 'alias'
+    canonical.mkdir()
+    alias.symlink_to(canonical, target_is_directory=True)
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': canonical}), \
+         patch.object(updates, 'REPO_ROOT', alias), \
+         patch.object(updates, '_check_repo') as check_repo, \
+         patch.object(updates, '_run_git') as run_git, \
+         patch.object(updates, '_webui_update_applyability_info') as webui_probe, \
+         patch.object(updates, '_restart_blocker_snapshot') as restart_probe, \
+         patch.object(updates, '_apply_update_inner') as apply_inner:
+        checked = updates.check_for_updates(force=True, include_agent=False, channel='stable')
+        applied = updates.apply_update('webui', channel='stable')
+
+    assert checked['webui']['reason'] == 'managed_update_maintenance'
+    assert applied['reason'] == 'managed_update_maintenance'
+    for mock in (check_repo, run_git, webui_probe, restart_probe, apply_inner):
+        mock.assert_not_called()
+
+
+def test_path_resolution_error_refuses_check_and_apply_without_fallback(tmp_path):
+    canonical = tmp_path / 'managed'
+    alias = tmp_path / 'alias'
+    canonical.mkdir()
+    alias.mkdir()
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': canonical}), \
+         patch.object(updates, 'REPO_ROOT', alias), \
+         patch.object(updates.Path, 'resolve', side_effect=RuntimeError('resolution failed')), \
+         patch.object(updates, '_check_repo') as check_repo, \
+         patch.object(updates, '_run_git') as run_git, \
+         patch.object(updates, '_webui_update_applyability_info') as webui_probe, \
+         patch.object(updates, '_restart_blocker_snapshot') as restart_probe, \
+         patch.object(updates, '_apply_update_inner') as apply_inner:
+        checked = updates.check_for_updates(force=True, include_agent=False, channel='stable')
+        applied = updates.apply_update('webui', channel='stable')
+
+    assert checked['webui']['reason'] == 'managed_update_maintenance'
+    assert applied['reason'] == 'managed_update_maintenance'
+    for mock in (check_repo, run_git, webui_probe, restart_probe, apply_inner):
+        mock.assert_not_called()
+
+
+def test_unrelated_valid_path_keeps_normal_check_and_applyability_path(tmp_path):
+    canonical = tmp_path / 'managed'
+    unrelated = tmp_path / 'unrelated'
+    canonical.mkdir()
+    unrelated.mkdir()
+    check_repo = MagicMock(return_value={'name': 'webui', 'behind': 0})
+    applyability = MagicMock(return_value=None)
+    with patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': canonical}), \
+         patch.object(updates, 'REPO_ROOT', unrelated), \
+         patch.object(updates, '_AGENT_DIR', None), \
+         patch.object(updates, '_check_repo', check_repo), \
+         patch.object(updates, '_webui_update_applyability_info', applyability):
+        checked = updates.check_for_updates(force=True, include_agent=False, channel='stable')
+
+    assert checked['webui']['behind'] == 0
+    check_repo.assert_called_once_with(unrelated, 'webui', 'stable')
+    applyability.assert_called_once_with()
 
 
 def _fake_git_for_release_fetch_failure(args, cwd, timeout=10):
@@ -1323,6 +1809,102 @@ def test_inventory_locks_handles_missing_git_dir(tmp_path):
         'well_known_lock_path': None,
         'other_locks': [],
     }
+
+
+@pytest.mark.parametrize('target', ['webui', 'agent'])
+def test_apply_clear_lock_guards_canonical_target_at_function_entry(tmp_path, target):
+    repo = tmp_path / target
+    repo.mkdir()
+    downstream = {
+        '_restart_blocker_snapshot': MagicMock(name='_restart_blocker_snapshot'),
+        '_inventory_locks': MagicMock(name='_inventory_locks'),
+        '_read_update_channel': MagicMock(name='_read_update_channel'),
+        '_apply_update_inner': MagicMock(name='_apply_update_inner'),
+        '_run_git': MagicMock(name='_run_git'),
+    }
+    apply_lock = MagicMock(name='_apply_lock')
+    apply_lock.acquire.return_value = True
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {target: repo}))
+        stack.enter_context(patch.object(updates, 'REPO_ROOT', repo))
+        stack.enter_context(patch.object(updates, '_AGENT_DIR', repo))
+        stack.enter_context(patch.object(updates, '_apply_lock', apply_lock))
+        for name, mock in downstream.items():
+            stack.enter_context(patch.object(updates, name, mock))
+
+        result = updates.apply_clear_lock(target)
+
+    assert result['reason'] == 'managed_update_maintenance'
+    assert result['can_apply'] is False
+    assert result['operation'] == 'clear_lock'
+    apply_lock.acquire.assert_not_called()
+    for mock in downstream.values():
+        mock.assert_not_called()
+
+
+@pytest.mark.parametrize('target', ['webui', 'agent'])
+def test_clear_lock_http_route_executes_real_guarded_handler(tmp_path, target):
+    from tests.test_gateway_watcher_profile import _FakeHandler
+    from api import routes
+
+    repo = tmp_path / target
+    repo.mkdir()
+    downstream = {
+        '_restart_blocker_snapshot': MagicMock(name='_restart_blocker_snapshot'),
+        '_inventory_locks': MagicMock(name='_inventory_locks'),
+        '_read_update_channel': MagicMock(name='_read_update_channel'),
+        '_apply_update_inner': MagicMock(name='_apply_update_inner'),
+        '_run_git': MagicMock(name='_run_git'),
+    }
+    apply_lock = MagicMock(name='_apply_lock')
+    apply_lock.acquire.return_value = True
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {target: repo}))
+        stack.enter_context(patch.object(updates, 'REPO_ROOT', repo))
+        stack.enter_context(patch.object(updates, '_AGENT_DIR', repo))
+        stack.enter_context(patch.object(updates, '_apply_lock', apply_lock))
+        stack.enter_context(patch.object(routes, '_check_csrf', lambda handler: True))
+        stack.enter_context(patch.object(routes, 'read_body', lambda handler: {'target': target}))
+        for name, mock in downstream.items():
+            stack.enter_context(patch.object(updates, name, mock))
+
+        handler = _FakeHandler()
+        routes.handle_post(handler, urlparse('/api/updates/clear_lock'))
+        result = handler.get_json()
+
+    assert result['reason'] == 'managed_update_maintenance'
+    assert result['can_apply'] is False
+    assert result['operation'] == 'clear_lock'
+    apply_lock.acquire.assert_not_called()
+    for mock in downstream.values():
+        mock.assert_not_called()
+
+
+def test_apply_clear_lock_unrelated_valid_path_keeps_no_lock_retry_behavior(tmp_path):
+    canonical = tmp_path / 'managed'
+    unrelated = tmp_path / 'unrelated'
+    (unrelated / '.git').mkdir(parents=True)
+    retry_result = {'ok': True, 'target': 'webui'}
+    apply_inner = MagicMock(return_value=retry_result)
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(updates, '_MAINTENANCE_TARGET_PATHS', {'webui': canonical}))
+        stack.enter_context(patch.object(updates, 'REPO_ROOT', unrelated))
+        stack.enter_context(patch.object(updates, '_apply_lock', MagicMock(
+            acquire=MagicMock(return_value=True), release=MagicMock())))
+        stack.enter_context(patch.object(updates, '_restart_blocker_snapshot', MagicMock(
+            return_value={'restart_blocked': False})))
+        stack.enter_context(patch.object(updates, '_inventory_locks', MagicMock(return_value={
+            'well_known_lock_present': False,
+            'well_known_lock_path': str(unrelated / '.git' / 'index.lock'),
+            'other_locks': [],
+        })))
+        stack.enter_context(patch.object(updates, '_read_update_channel', MagicMock(return_value='stable')))
+        stack.enter_context(patch.object(updates, '_apply_update_inner', apply_inner))
+        result = updates.apply_clear_lock('webui')
+
+    assert result['ok'] is True
+    assert result['lock_recovery']['action'] == 'no-lock-found'
+    apply_inner.assert_called_once_with('webui', 'stable')
 
 
 def test_apply_clear_lock_with_no_lock_runs_normal_update(tmp_path, monkeypatch):

@@ -110,6 +110,7 @@ def test_get_update_check_returns_cache_without_fetch(monkeypatch):
 def test_cached_update_status_does_not_drop_agent_info_when_reenabled(monkeypatch):
     from api import updates
 
+    monkeypatch.setattr(updates, "_MAINTENANCE_TARGET_PATHS", {})
     cached_agent = {"name": "agent", "behind": 2}
     monkeypatch.setattr(
         updates,
