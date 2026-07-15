@@ -10,6 +10,14 @@ import pytest
 import api.updates as updates
 
 
+def test_update_module_runs_under_automatic_downstream_isolation():
+    from downstream_test_isolation import _audit_active, assert_safe_network
+
+    assert _audit_active() is True
+    with pytest.raises(RuntimeError, match="downstream test isolation"):
+        assert_safe_network(("127.0.0.1", 8787))
+
+
 @pytest.mark.parametrize('operation', ['check', 'cached_status', 'apply', 'force_apply'])
 @pytest.mark.parametrize('channel', [[], {}], ids=['list-channel', 'dict-channel'])
 def test_malformed_channel_is_contained_without_normalization_or_side_effects(tmp_path, operation, channel):

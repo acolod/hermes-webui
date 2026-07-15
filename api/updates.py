@@ -24,6 +24,7 @@ from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlparse
 
+from api import config as api_config
 from api.gateway_restart import restart_active_profile_gateway
 from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
 
@@ -50,6 +51,7 @@ _MAINTENANCE_TARGET_PATHS = {
     'agent': Path('/home/alex/.hermes/hermes-agent'),
     'webui': Path('/home/alex/hermes-webui'),
 }
+_UPDATE_TARGET_POLICY_PATH = Path('/home/alex/.config/hermes-webui/update-targets.json')
 _CREDENTIAL_IN_URL_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/@\s'\"]+)@")
 _GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")
 _QUERY_SECRET_RE = re.compile(r"([?&](?:access_token|oauth_token|private_token|client_secret|app_secret|api[_-]?key|token|password|secret|auth|key)=)[^&\s'\"]+", re.IGNORECASE)
@@ -102,52 +104,304 @@ def _sanitize_git_diagnostic(output: str, *, limit: int = _GIT_DIAGNOSTIC_MAX_CH
     return sanitized
 
 
-def _maintenance_guard_response(target: str, path: Path | None, *, operation: str) -> dict | None:
-    """Refuse all update actions for canonical targets during migration."""
-    expected = _MAINTENANCE_TARGET_PATHS.get(target)
-    if expected is None:
-        return None
-    if path is not None:
-        expected = Path(expected)
-        path = Path(path)
-        if path != expected:
-            try:
-                if path.resolve() != expected.resolve():
-                    return None
-            except Exception:
-                # A configured target must fail closed if its identity cannot be
-                # established. Never continue into probes or stock Git on ambiguity.
-                pass
+def _managed_refusal(target: str, operation: str, reason: str, message: str) -> dict:
     return {
         'ok': False,
         'target': target,
-        'reason': 'managed_update_maintenance',
+        'reason': reason,
+        'apply_reason': reason,
         'can_apply': False,
-        'maintenance': True,
+        'maintenance': reason == 'managed_update_maintenance',
         'operation': operation,
-        'message': (
-            f'{target.capitalize()} updates are temporarily disabled while the '
-            'managed downstream update path is being installed. No stock Git '
-            'update or Force Update was run.'
-        ),
+        'message': message,
+        'apply_message': message,
     }
+
+
+def _managed_target_config(target: str, path: Path | None) -> tuple[dict | None, dict | None]:
+    """Return validated external-target policy or a fail-closed response."""
+    expected = _MAINTENANCE_TARGET_PATHS.get(target)
+    if expected is None:
+        return None, None
+    actual = Path(path) if path is not None else None
+    try:
+        if actual is None:
+            raise ValueError('managed target path is unavailable')
+        if actual.resolve() != Path(expected).resolve():
+            return None, None
+    except Exception:
+        return None, _managed_refusal(
+            target,
+            'identity',
+            'managed_update_maintenance',
+            f'{target.capitalize()} remains fail-closed because its managed checkout identity could not be established. No stock Git update or Force Update was run.',
+        )
+    try:
+        policy_path = Path(_UPDATE_TARGET_POLICY_PATH)
+        st = policy_path.stat()
+        if (
+            policy_path.is_symlink()
+            or not policy_path.is_file()
+            or st.st_uid != os.getuid()
+            or (st.st_mode & 0o777) != 0o600
+            or st.st_size > 128 * 1024
+        ):
+            raise ValueError('policy ownership, mode, type, or size is invalid')
+        root = json.loads(policy_path.read_text(encoding='utf-8'))
+        config = root['targets'][target]
+        if root.get('schema_version') != 1 or config.get('schema_version') != 1:
+            raise ValueError('unsupported policy schema')
+        if config.get('target_name') != target or config.get('mode') != 'external':
+            raise ValueError('target is not explicitly external')
+    except Exception as exc:
+        return None, _managed_refusal(
+            target,
+            'policy',
+            'managed_policy_unavailable',
+            f'{target.capitalize()} is a managed downstream target, but its external update policy is unavailable or invalid: {exc}',
+        )
+
+    configured = Path(str(config.get('canonical_repo_path') or ''))
+    try:
+        if not configured.is_absolute() or configured.resolve() != Path(expected).resolve():
+            raise ValueError('configured canonical path does not match the managed target')
+    except Exception:
+        return None, _managed_refusal(
+            target,
+            'identity',
+            'managed_update_maintenance',
+            f'{target.capitalize()} remains fail-closed because its managed checkout identity could not be established. No stock Git update or Force Update was run.',
+        )
+
+    executable = Path(str(config.get('updater_executable_path') or ''))
+    if (
+        not executable.is_absolute()
+        or not executable.is_file()
+        or executable.is_symlink()
+        or not os.access(executable, os.X_OK)
+    ):
+        return None, _managed_refusal(
+            target,
+            'updater',
+            'managed_updater_unavailable',
+            f'{target.capitalize()} is externally managed, but the configured updater is missing or unusable. No stock Git update or Force Update was run.',
+        )
+    return dict(config), None
+
+
+def _run_managed_updater(target: str, command: str) -> tuple[dict, int]:
+    config, refusal = _managed_target_config(target, _repo_path_for_update_target(target))
+    if refusal is not None:
+        return refusal, 20
+    if config is None:
+        return {'schema_version': 1, 'state': 'failed', 'failure_phase': 'managed_policy_unavailable'}, 20
+    executable = str(config['updater_executable_path'])
+    try:
+        completed = subprocess.run(
+            [executable, command, target],
+            cwd=str(config['canonical_repo_path']),
+            capture_output=True,
+            text=True,
+            timeout=3600,
+            check=False,
+        )
+    except Exception as exc:
+        return {'schema_version': 1, 'state': 'failed', 'failure_phase': 'updater_spawn', 'message': str(exc)}, 20
+    lines = [line for line in (completed.stdout or '').splitlines() if line.strip()]
+    try:
+        payload = json.loads(lines[0]) if len(lines) == 1 else None
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict) or payload.get('schema_version') != 1:
+        message = _sanitize_git_diagnostic(completed.stderr or completed.stdout or 'invalid updater output')
+        return {'schema_version': 1, 'state': 'failed', 'failure_phase': 'updater_protocol', 'message': message}, completed.returncode or 20
+    return payload, completed.returncode
+
+
+def _run_managed_resume(target: str, transaction_id: str, executable: str) -> tuple[dict, int]:
+    try:
+        completed = subprocess.run(
+            [executable, 'resume', transaction_id],
+            cwd=str(_repo_path_for_update_target(target)),
+            capture_output=True,
+            text=True,
+            timeout=3600,
+            check=False,
+        )
+    except Exception as exc:
+        return {'schema_version': 1, 'state': 'failed', 'failure_phase': 'updater_resume_spawn', 'message': str(exc)}, 20
+    lines = [line for line in (completed.stdout or '').splitlines() if line.strip()]
+    try:
+        payload = json.loads(lines[0]) if len(lines) == 1 else None
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict) or payload.get('schema_version') != 1:
+        message = _sanitize_git_diagnostic(completed.stderr or completed.stdout or 'invalid updater resume output')
+        return {'schema_version': 1, 'state': 'failed', 'failure_phase': 'updater_protocol', 'message': message}, completed.returncode or 20
+    return payload, completed.returncode
+
+
+def _configured_webui_health_url() -> str:
+    return api_config.configured_health_url()
+
+
+def _current_webui_server_started_at() -> float:
+    health_url = _configured_webui_health_url()
+    with urllib.request.urlopen(health_url, timeout=3) as response:
+        payload = json.loads(response.read().decode('utf-8'))
+    if payload.get('status') != 'ok':
+        raise RuntimeError('current WebUI health probe is not healthy')
+    return float(payload['server_started_at'])
+
+
+def _schedule_managed_resume_after_restart(target: str, transaction_id: str, executable: str) -> None:
+    """Launch a detached health waiter that completes the updater transaction."""
+    previous_server_started_at = _current_webui_server_started_at()
+    state_root = Path.home() / '.local' / 'state' / 'hermes-downstream-updater'
+    state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log_path = state_root / f'restart-completion-{transaction_id}.log'
+    fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    log_file = os.fdopen(fd, 'a', encoding='utf-8')
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                '-m',
+                'api.managed_update_resume',
+                '--updater', executable,
+                '--transaction', transaction_id,
+                '--target', target,
+                '--previous-server-started-at', str(previous_server_started_at),
+            ],
+            cwd=str(REPO_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            start_new_session=True,
+        )
+    finally:
+        log_file.close()
+
+
+def _managed_check_payload(target: str, payload: dict, returncode: int) -> dict:
+    failure = str(payload.get('failure_phase') or '')
+    dirty = bool(payload.get('dirty'))
+    can_apply = returncode == 0 and bool(payload.get('can_start')) and not dirty and not failure
+    reason = 'managed_external_update' if can_apply else (failure or 'managed_external_refusal')
+    message = str(payload.get('message') or payload.get('refusal_reason') or (
+        f'{target.capitalize()} will update through the external local/live candidate workflow.'
+        if can_apply else f'{target.capitalize()} cannot be updated safely in its current state.'
+    ))
+    delta = payload.get('ahead_behind') if isinstance(payload.get('ahead_behind'), dict) else {}
+    return {
+        'name': target,
+        'target': target,
+        'managed_external': True,
+        'behind': delta.get('behind'),
+        'ahead': delta.get('ahead'),
+        'branch': payload.get('branch'),
+        'current_sha': payload.get('head'),
+        'dirty': dirty,
+        'can_apply': can_apply,
+        'apply_reason': reason,
+        'apply_message': message,
+        'reason': reason,
+        'message': message,
+        'updater_version': payload.get('updater_version'),
+        'updater_state': payload.get('state'),
+        'failure_phase': payload.get('failure_phase'),
+    }
+
+
+def _managed_apply_payload(target: str, payload: dict, returncode: int, executable: str) -> dict:
+    state = str(payload.get('state') or 'failed')
+    reason = str(payload.get('failure_phase') or ('managed_external_update' if returncode == 0 else 'managed_updater_failed'))
+    response = {
+        'ok': returncode == 0,
+        'target': target,
+        'managed_external': True,
+        'reason': reason,
+        'can_apply': False,
+        'state': state,
+        'transaction_id': payload.get('transaction_id'),
+        'failure_phase': payload.get('failure_phase'),
+        'message': str(payload.get('message') or ('Update candidate validated and published.' if returncode == 0 else 'Managed updater failed safely.')),
+        'recovery_refs': payload.get('recovery_refs') or {},
+        'tested_candidate_oid': payload.get('tested_candidate_oid'),
+        'published_oid': payload.get('published_oid'),
+        'restart_state': payload.get('restart_state'),
+    }
+    if returncode != 0:
+        return response
+    with _cache_lock:
+        _update_cache['checked_at'] = 0
+    if state == 'completed':
+        response['up_to_date'] = bool(payload.get('no_op'))
+        response['restart_scheduled'] = False
+        return response
+    if state != 'restart_required':
+        response.update(ok=False, reason='managed_updater_incomplete')
+        return response
+    if target == 'agent':
+        gateway_ok, gateway_result = _ensure_gateway_restart_for_agent_update()
+        response['gateway_restart'] = gateway_result.get('status')
+        if not gateway_ok:
+            response.update(ok=False, reason='restart_failed', message=_agent_gateway_restart_failure_message(target, gateway_result))
+            return response
+        completed, resume_code = _run_managed_resume(target, str(payload['transaction_id']), executable)
+        response.update(
+            ok=resume_code == 0 and completed.get('state') == 'completed',
+            state=completed.get('state'),
+            reason=str(completed.get('failure_phase') or 'managed_external_update'),
+            failure_phase=completed.get('failure_phase'),
+            message=str(completed.get('message') or 'Agent restarted and passed the managed health probe.'),
+            restart_state=completed.get('restart_state'),
+            restart_scheduled=False,
+        )
+        return response
+    _schedule_managed_resume_after_restart(target, str(payload['transaction_id']), executable)
+    _schedule_restart()
+    response['restart_scheduled'] = True
+    return response
+
+
+def _maintenance_guard_response(target: str, path: Path | None, *, operation: str) -> dict | None:
+    """Route known managed targets externally or refuse before any stock path."""
+    config, refusal = _managed_target_config(target, path)
+    if refusal is not None:
+        refusal['operation'] = operation
+        return refusal
+    if config is None:
+        return None
+    if operation == 'force':
+        return _managed_refusal(target, operation, 'managed_force_update_unavailable', 'Force Update is unavailable for externally managed targets.')
+    if operation == 'clear_lock':
+        return _managed_refusal(target, operation, 'managed_clear_lock_unavailable', 'Stock lock recovery is unavailable for externally managed targets; the external updater owns concurrency and recovery.')
+    if operation == 'apply':
+        payload, returncode = _run_managed_updater(target, 'start')
+        return _managed_apply_payload(target, payload, returncode, str(config['updater_executable_path']))
+    return None
 
 
 def _maintenance_check_info(target: str, path: Path | None) -> dict | None:
-    """Return a stable check payload for a temporarily contained target."""
-    guarded = _maintenance_guard_response(target, path, operation='check')
-    if guarded is None:
+    """Return external updater check metadata or a fail-closed managed response."""
+    config, refusal = _managed_target_config(target, path)
+    if refusal is not None:
+        return {
+            'name': target,
+            'behind': None,
+            'can_apply': False,
+            'apply_reason': refusal['reason'],
+            'apply_message': refusal['message'],
+            'maintenance': refusal.get('maintenance', False),
+            'reason': refusal['reason'],
+            'message': refusal['message'],
+        }
+    if config is None:
         return None
-    return {
-        'name': target,
-        'behind': None,
-        'can_apply': False,
-        'apply_reason': guarded['reason'],
-        'apply_message': guarded['message'],
-        'maintenance': True,
-        'reason': guarded['reason'],
-        'message': guarded['message'],
-    }
+    payload, returncode = _run_managed_updater(target, 'check')
+    return _managed_check_payload(target, payload, returncode)
 
 
 def _apply_fetch_failure_message(fetch_out: str, network_message: str) -> str:

@@ -26,6 +26,12 @@ import urllib.request
 import urllib.error
 import pytest
 
+os.environ["HERMES_DOWNSTREAM_TEST_GUARD"] = "1"
+sys.dont_write_bytecode = True
+from downstream_test_isolation import install_audit_guard
+
+install_audit_guard()
+
 if not (3, 11) <= sys.version_info[:2] <= (3, 13):
     pytest.exit(
         "Hermes WebUI tests require Python 3.11, 3.12, or 3.13. "
@@ -460,8 +466,7 @@ os.execv = _pytest_session_safe_execv
 #   - hostnames `localhost`, `*.local`, `*.test`, `*.example`, `*.example.com`
 #     `*.example.net`, `*.example.org`, `*.invalid` (RFC2606/6761 reserved)
 #
-# A test that opts in via the `allow_outbound_network` fixture sees the real
-# socket.create_connection.
+# No fixture may restore unrestricted sockets for update-routing tests.
 import socket as _hermes_test_socket
 _REAL_CREATE_CONNECTION = _hermes_test_socket.create_connection
 _REAL_SOCKET_CONNECT = _hermes_test_socket.socket.connect
@@ -546,27 +551,6 @@ _hermes_test_socket.create_connection = _hermes_blocked_create_connection
 _hermes_test_socket.socket.connect = _hermes_blocked_socket_connect
 
 
-@pytest.fixture
-def allow_outbound_network(monkeypatch):
-    """Opt-in to real outbound network for the duration of one test.
-
-    Swaps `socket.create_connection` and `socket.socket.connect` back to the
-    real (unwrapped) implementations for this test only, then monkeypatch
-    teardown restores the wrapped versions. Direct swap is more reliable
-    than a module-global toggle on CI runners where wrapper-closure
-    lookup semantics can surprise.
-
-    Use sparingly. Today zero tests in the repo call this — the previous
-    test_dns_resolution_failure case was rewritten to mock socket.getaddrinfo
-    instead, which is fully hermetic.
-    """
-    monkeypatch.setattr(_hermes_test_socket, "create_connection", _REAL_CREATE_CONNECTION)
-    monkeypatch.setattr(_hermes_test_socket.socket, "connect", _REAL_SOCKET_CONNECT)
-    yield
-
-
-
-
 # ── Environment isolation for tests ────────────────────────────────────────
 # HERMES_WEBUI_SKIP_ONBOARDING is set by hosting providers (e.g. Agent37) and
 # by some isolated test harnesses to short-circuit the onboarding wizard.
@@ -584,6 +568,41 @@ def _strip_skip_onboarding_env():
     if prior is not None:
         os.environ["HERMES_WEBUI_SKIP_ONBOARDING"] = prior
 
+_DOWNSTREAM_FOCUSED_ONLY = False
+
+
+def _is_downstream_update_test_path(path) -> bool:
+    test_path = pathlib.Path(str(path))
+    name = test_path.name
+    direct_update_import = False
+    try:
+        source = test_path.read_text(encoding="utf-8")
+        direct_update_import = any(
+            token in source
+            for token in (
+                "import api.updates",
+                "from api import updates",
+                "managed_update_resume",
+                "external_downstream",
+            )
+        )
+    except OSError:
+        pass
+    return (
+        "update" in name
+        or "restart" in name
+        or direct_update_import
+        or name == "test_downstream_update_isolation_guard.py"
+    )
+
+
+def pytest_runtest_setup(item):
+    if _is_downstream_update_test_path(item.fspath):
+        os.environ["HERMES_DOWNSTREAM_TEST_GUARD_ACTIVE"] = "1"
+    else:
+        os.environ.pop("HERMES_DOWNSTREAM_TEST_GUARD_ACTIVE", None)
+
+
 def pytest_collection_modifyitems(config, items):
     """Auto-skip agent-dependent tests when hermes-agent is not available.
 
@@ -592,6 +611,11 @@ def pytest_collection_modifyitems(config, items):
     This keeps the test files clean and ensures new cron/skills tests
     get auto-skipped without manual annotation.
     """
+    global _DOWNSTREAM_FOCUSED_ONLY
+    _DOWNSTREAM_FOCUSED_ONLY = bool(items) and all(
+        _is_downstream_update_test_path(item.fspath) for item in items
+    )
+
     if AGENT_MODULES_AVAILABLE:
         return  # everything available, run all tests
 
@@ -870,6 +894,12 @@ def test_server():
     Start an isolated test server on TEST_PORT with a clean state directory.
     Paths are discovered dynamically -- no hardcoded absolute path assumptions.
     """
+    if _DOWNSTREAM_FOCUSED_ONLY:
+        # Updater/routing units mock subprocess and HTTP boundaries. Do not
+        # create a listener when the collected suite is only these guarded files.
+        yield None
+        return
+
     # Kill any leftover process on the test port before starting.
     # Stale servers from QA harness runs or prior test sessions cause
     # conftest to think the server is already up, producing false failures.

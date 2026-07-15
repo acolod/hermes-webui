@@ -49,6 +49,16 @@ HOST = os.getenv("HERMES_WEBUI_HOST", "127.0.0.1")
 PORT = int(os.getenv("HERMES_WEBUI_PORT", "8787"))
 
 
+def configured_health_url() -> str:
+    """Return the local health URL for the configured WebUI bind."""
+    host = str(HOST).strip()
+    if host in {"", "0.0.0.0", "::", "localhost", "::1"}:
+        host = "127.0.0.1"
+    elif ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{int(PORT)}/health"
+
+
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     """Read a positive int from the environment, falling back on bad input.
 
