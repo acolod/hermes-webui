@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 
 from api.gateway_restart import restart_active_profile_gateway
 from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
+from api.external_update_adapter import managed_check, managed_force_refusal, managed_update
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,7 @@ _check_in_progress = False
 _apply_lock = threading.Lock()   # prevents concurrent stash/pull/pop on same repo
 CACHE_TTL = 1800  # 30 minutes
 _GIT_DIAGNOSTIC_MAX_CHARS = 300
-# Temporary containment during Revision 2.1 migration. These canonical paths are
-# deliberately independent of the current branch: both checkouts remain managed
-# even while WebUI changes from its pre-migration `master` branch to `local/live`.
-_MAINTENANCE_TARGET_PATHS = {
+_EXTERNALLY_MANAGED_TARGET_PATHS = {
     'agent': Path('/home/alex/.hermes/hermes-agent'),
     'webui': Path('/home/alex/hermes-webui'),
 }
@@ -102,51 +100,108 @@ def _sanitize_git_diagnostic(output: str, *, limit: int = _GIT_DIAGNOSTIC_MAX_CH
     return sanitized
 
 
-def _maintenance_guard_response(target: str, path: Path | None, *, operation: str) -> dict | None:
-    """Refuse all update actions for canonical targets during migration."""
-    expected = _MAINTENANCE_TARGET_PATHS.get(target)
+def _is_externally_managed(target: str) -> bool:
+    expected = _EXTERNALLY_MANAGED_TARGET_PATHS.get(target)
     if expected is None:
-        return None
-    if path is not None:
-        expected = Path(expected)
-        path = Path(path)
-        if path != expected:
-            try:
-                if path.resolve() != expected.resolve():
-                    return None
-            except Exception:
-                # A configured target must fail closed if its identity cannot be
-                # established. Never continue into probes or stock Git on ambiguity.
-                pass
-    return {
-        'ok': False,
-        'target': target,
-        'reason': 'managed_update_maintenance',
-        'can_apply': False,
-        'maintenance': True,
-        'operation': operation,
-        'message': (
-            f'{target.capitalize()} updates are temporarily disabled while the '
-            'managed downstream update path is being installed. No stock Git '
-            'update or Force Update was run.'
-        ),
-    }
+        return False
+    actual = REPO_ROOT if target == 'webui' else _AGENT_DIR if target == 'agent' else None
+    if actual is None:
+        return True
+    actual_path = Path(actual)
+    expected_path = Path(expected)
+    if actual_path == expected_path:
+        return True
+    try:
+        return actual_path.resolve() == expected_path.resolve()
+    except OSError:
+        return True
 
 
-def _maintenance_check_info(target: str, path: Path | None) -> dict | None:
-    """Return a stable check payload for a temporarily contained target."""
-    guarded = _maintenance_guard_response(target, path, operation='check')
-    if guarded is None:
-        return None
+def _managed_check_info(target: str) -> dict:
+    """Map the external updater's check result into the existing update-card shape."""
+    payload = managed_check(target)
+    if not isinstance(payload, dict) or payload.get('ok') is not True:
+        reason = (
+            payload.get('reason')
+            if isinstance(payload, dict)
+            else 'managed_updater_invalid_response'
+        ) or 'managed_updater_check_failed'
+        message = (
+            payload.get('message')
+            if isinstance(payload, dict)
+            else 'Managed updater did not return a JSON object'
+        ) or 'Managed updater check failed'
+        return {
+            'name': target,
+            'behind': None,
+            'can_apply': False,
+            'reason': str(reason),
+            'apply_reason': str(reason),
+            'apply_message': str(message),
+            'message': str(message),
+            'error': str(message),
+            'managed_external': True,
+        }
+
+    results = payload.get('results')
+    if (
+        not isinstance(results, list)
+        or len(results) != 1
+        or not isinstance(results[0], dict)
+        or results[0].get('target') != target
+    ):
+        message = 'Managed updater returned a malformed check result'
+        return {
+            'name': target,
+            'behind': None,
+            'can_apply': False,
+            'reason': 'managed_updater_invalid_response',
+            'apply_reason': 'managed_updater_invalid_response',
+            'apply_message': message,
+            'message': message,
+            'error': message,
+            'managed_external': True,
+        }
+
+    summary = results[0]
+    upstream_only = summary.get('upstream_only')
+    local_only = summary.get('local_only')
+    if not isinstance(upstream_only, int) or not isinstance(local_only, int):
+        message = 'Managed updater returned invalid update counts'
+        return {
+            'name': target,
+            'behind': None,
+            'can_apply': False,
+            'reason': 'managed_updater_invalid_response',
+            'apply_reason': 'managed_updater_invalid_response',
+            'apply_message': message,
+            'message': message,
+            'error': message,
+            'managed_external': True,
+        }
+
+    commits = summary.get('upstream_commits')
+    if not isinstance(commits, list) or not all(isinstance(item, str) for item in commits):
+        commits = []
+    upstream_ref = str(summary.get('upstream_ref') or '')
+    head = str(summary.get('head') or '')
+    up_to_date = bool(summary.get('up_to_date'))
     return {
         'name': target,
-        'behind': None,
-        'can_apply': False,
-        'apply_reason': guarded['reason'],
-        'apply_message': guarded['message'],
-        'maintenance': True,
-        'reason': guarded['reason'],
-        'message': guarded['message'],
+        'behind': upstream_only,
+        'current_sha': head,
+        'latest_sha': None,
+        'branch': upstream_ref,
+        'upstream_ref': upstream_ref,
+        'local_ahead': local_only,
+        'local_behind': upstream_only,
+        'upstream_commits': commits[:20],
+        'up_to_date': up_to_date,
+        'can_apply': not up_to_date,
+        'apply_reason': 'managed_external',
+        'apply_message': 'Update through the managed downstream updater.',
+        'managed_external': True,
+        'dirty': False,
     }
 
 
@@ -358,11 +413,13 @@ def apply_clear_lock(target: str) -> dict:
         (now that the lock is gone) will take the success branch and
         re-run the normal apply.
     """
-    maintenance = _maintenance_guard_response(
-        target, _repo_path_for_update_target(target), operation='clear_lock'
-    )
-    if maintenance is not None:
-        return maintenance
+    if _is_externally_managed(target):
+        return {
+            'ok': False,
+            'target': target,
+            'reason': 'managed_lock_owned_externally',
+            'message': 'Lock management belongs to the external downstream updater.',
+        }
 
     blocker_snapshot = _restart_blocker_snapshot()
     if blocker_snapshot.get('restart_blocked'):
@@ -1350,50 +1407,9 @@ def _merge_applyability_info(info: dict | None, applyability: dict | None) -> di
     return merged
 
 
-def _maintenance_status(*, include_agent: bool, channel: str | None) -> dict | None:
-    """Build a cache-safe status when every requested live target is contained."""
-    webui_info = _maintenance_check_info('webui', REPO_ROOT)
-    agent_info = _maintenance_check_info('agent', _AGENT_DIR) if include_agent else _ignored_agent_update_info()
-    if webui_info is None or (include_agent and agent_info is None):
-        return None
-    safe_channel = (
-        channel if isinstance(channel, str) and channel in _CHANNEL_TAG_GLOBS
-        else DEFAULT_UPDATE_CHANNEL
-    )
-    return {
-        'webui': webui_info,
-        'agent': agent_info,
-        'checked_at': time.time(),
-        'include_agent': include_agent,
-        'channel': safe_channel,
-    }
-
-
-def _overlay_maintenance_status(cached: dict, *, include_agent: bool, channel: str | None) -> dict:
-    """Replace cached normal entries for any currently contained target."""
-    result = dict(cached)
-    webui_info = _maintenance_check_info('webui', REPO_ROOT)
-    if webui_info is not None:
-        result['webui'] = webui_info
-    if include_agent:
-        agent_info = _maintenance_check_info('agent', _AGENT_DIR)
-        if agent_info is not None:
-            result['agent'] = agent_info
-    else:
-        result['agent'] = _ignored_agent_update_info()
-    result['include_agent'] = include_agent
-    if channel is not None:
-        result['channel'] = channel
-    return result
-
-
 def cached_update_status(*, include_agent=True, channel=None):
     """Return cached update status without performing network or git mutations."""
     include_agent = bool(include_agent)
-    maintenance = _maintenance_status(include_agent=include_agent, channel=channel)
-    if maintenance is not None:
-        maintenance['cached'] = True
-        return maintenance
     if channel is None:
         channel = _read_update_channel()
     channel = _normalize_channel(channel)
@@ -1410,16 +1426,13 @@ def cached_update_status(*, include_agent=True, channel=None):
         if not include_agent:
             cached['agent'] = _ignored_agent_update_info()
     cached['cached'] = True
-    return _overlay_maintenance_status(cached, include_agent=include_agent, channel=channel)
+    return cached
 
 
 def check_for_updates(force=False, *, include_agent=True, channel=None):
     """Return cached update status for webui and agent repos."""
     global _check_in_progress
     include_agent = bool(include_agent)
-    maintenance = _maintenance_status(include_agent=include_agent, channel=channel)
-    if maintenance is not None:
-        return maintenance
     if channel is None:
         channel = _read_update_channel()
     channel = _normalize_channel(channel)
@@ -1437,29 +1450,30 @@ def check_for_updates(force=False, *, include_agent=True, channel=None):
             and cache_matches
             and time.time() - _update_cache['checked_at'] < CACHE_TTL
         ):
-            return _overlay_maintenance_status(dict(_update_cache), include_agent=include_agent, channel=channel)
+            return dict(_update_cache)
         if _check_in_progress and cache_matches:
-            return _overlay_maintenance_status(dict(_update_cache), include_agent=include_agent, channel=channel)
+            return dict(_update_cache)  # another thread is already checking this channel
         _check_in_progress = True
 
     try:
-        # Run checks outside the lock (network I/O)
-        webui_info = _maintenance_check_info('webui', REPO_ROOT)
-        if webui_info is None:
+        # Machine-managed downstreams always use the external updater. A failed
+        # or malformed response is returned as a refusal and never falls through
+        # to the stock Git check path.
+        if _is_externally_managed('webui'):
+            webui_info = _managed_check_info('webui')
+        else:
             webui_info = _check_repo(REPO_ROOT, 'webui', channel)
             webui_info = _merge_applyability_info(webui_info, _webui_update_applyability_info())
-        # The update channel is a WebUI-only concept. The Agent is a separate
-        # project that tags plain v* and legitimately tracks master past its
-        # tags; it must ALWAYS use the default channel regardless of the user's
-        # WebUI channel selection. (Passing 'experimental' here makes the Agent
-        # ignore its v* tags and fall back to origin/main.)
-        agent_info = _maintenance_check_info('agent', _AGENT_DIR)
-        if agent_info is None:
-            agent_info = _check_repo(_AGENT_DIR, 'agent', DEFAULT_UPDATE_CHANNEL) if include_agent else _ignored_agent_update_info()
+        if include_agent and _is_externally_managed('agent'):
+            agent_info = _managed_check_info('agent')
+        else:
+            agent_info = _check_repo(
+                _AGENT_DIR, 'agent', DEFAULT_UPDATE_CHANNEL
+            ) if include_agent else _ignored_agent_update_info()
             if include_agent:
-                agent_info = _merge_applyability_info(agent_info, _agent_update_applyability_info())
-        elif not include_agent:
-            agent_info = _ignored_agent_update_info()
+                agent_info = _merge_applyability_info(
+                    agent_info, _agent_update_applyability_info()
+                )
 
         with _cache_lock:
             _update_cache['webui'] = webui_info
@@ -1490,6 +1504,10 @@ def _commit_subjects_for_update_with_limit(info: dict, *, limit: int = 24) -> tu
     """Return recent commit subjects plus whether the local list was capped."""
     if not isinstance(info, dict):
         return [], False
+    managed_subjects = info.get('upstream_commits')
+    if isinstance(managed_subjects, list):
+        subjects = [str(item).strip() for item in managed_subjects if str(item).strip()]
+        return subjects[:limit], len(subjects) > limit
     target = info.get('name')
     if target not in ('webui', 'agent'):
         target = 'webui' if info.get('repo_url', '').endswith('hermes-webui') else target
@@ -2014,9 +2032,8 @@ def apply_force_update(target: str, channel=None) -> dict:
     state. We refuse and return a clear message instead of silently downgrading.
     A deliberate rollback would be a separate, explicit feature.
     """
-    maintenance = _maintenance_guard_response(target, _repo_path_for_update_target(target), operation='force')
-    if maintenance is not None:
-        return maintenance
+    if _is_externally_managed(target):
+        return managed_force_refusal(target)
     if channel is None:
         channel = _read_update_channel()
     channel = _normalize_channel(channel)
@@ -2148,10 +2165,9 @@ def apply_force_update(target: str, channel=None) -> dict:
 
 
 def apply_update(target, channel=None):
-    """Stash, pull --ff-only, pop for the given target repo."""
-    maintenance = _maintenance_guard_response(target, _repo_path_for_update_target(target), operation='apply')
-    if maintenance is not None:
-        return maintenance
+    """Apply an update through the managed adapter or the stock fallback."""
+    if _is_externally_managed(target):
+        return managed_update(target)
     if channel is None:
         channel = _read_update_channel()
     channel = _normalize_channel(channel)
