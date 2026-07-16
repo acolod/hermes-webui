@@ -10,11 +10,19 @@ import sys
 import threading
 from pathlib import Path
 
-from api.profiles import get_active_hermes_home
+from api.profiles import (
+    _PROFILE_ID_RE,
+    _is_root_profile,
+    get_active_hermes_home,
+    get_active_profile_name,
+    get_hermes_home_for_profile,
+)
 
 logger = logging.getLogger(__name__)
 
 _GATEWAY_RESTART_LOCK = threading.Lock()
+_SYSTEM_GATEWAY_SERVICE = "hermes-gateway.service"
+_SYSTEM_GATEWAY_RESTART_HELPER = "/usr/local/sbin/hermes-gateway-restart-safe"
 
 
 def _resolve_hermes_command() -> str:
@@ -29,15 +37,11 @@ def _resolve_hermes_command() -> str:
     return "hermes"
 
 
-def _gateway_service_name() -> str:
-    return os.getenv("HERMES_GATEWAY_SERVICE_NAME", "hermes-gateway.service")
-
-
-def _system_gateway_is_active() -> bool:
-    """Return True when the system-scoped gateway service is active."""
+def _system_gateway_state() -> bool | None:
+    """Return whether the fixed system gateway is active, or None if unknown."""
     try:
         proc = subprocess.run(
-            ["systemctl", "is-active", _gateway_service_name()],
+            ["systemctl", "is-active", _SYSTEM_GATEWAY_SERVICE],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -45,20 +49,14 @@ def _system_gateway_is_active() -> bool:
             check=False,
         )
     except Exception:
+        return None
+
+    state = (proc.stdout or "").strip().lower()
+    if proc.returncode == 0 and state == "active":
+        return True
+    if proc.returncode == 3 and state in {"inactive", "failed"}:
         return False
-    return proc.returncode == 0 and (proc.stdout or "").strip() == "active"
-
-
-def _restart_command_for_active_scope(hermes_cmd: str) -> tuple[list[str], dict[str, str], str]:
-    """Choose the gateway restart command for the currently active service scope."""
-    active_home = get_active_hermes_home()
-    env = os.environ.copy()
-    env["HERMES_HOME"] = str(active_home)
-
-    if _system_gateway_is_active():
-        return ["sudo", "-n", hermes_cmd, "gateway", "restart", "--system"], env, "system"
-
-    return [hermes_cmd, "gateway", "restart"], env, "user"
+    return None
 
 
 def _consume_stream(stream) -> None:
@@ -74,15 +72,84 @@ def _release_lock() -> None:
     try:
         _GATEWAY_RESTART_LOCK.release()
     except RuntimeError:
+        # The lock may already have been released by another path.
         pass
+
+
+def _gateway_restart_profile_details(
+    profile: str | None = None,
+) -> tuple[Path, str | None, str]:
+    """Resolve one profile identity for both routing and command construction."""
+    if profile is None:
+        raw_profile = str(get_active_profile_name() or "default").strip()
+        active_home = Path(get_active_hermes_home())
+    else:
+        raw_profile = str(profile or "")
+        if not raw_profile or not _PROFILE_ID_RE.fullmatch(raw_profile):
+            raise ValueError(f"Invalid profile for gateway restart: {profile!r}")
+        active_home = Path(get_hermes_home_for_profile(raw_profile))
+
+    if (
+        raw_profile == "default"
+        and active_home.name == "default"
+        and active_home.parent.name == "profiles"
+    ):
+        return active_home, None, raw_profile
+    if not raw_profile or not _PROFILE_ID_RE.fullmatch(raw_profile) or _is_root_profile(raw_profile):
+        return active_home, "default", raw_profile
+    return active_home, raw_profile, raw_profile
+
+
+def _gateway_restart_profile_context(profile: str | None = None) -> tuple[Path, str | None]:
+    """Return the upstream HERMES_HOME and CLI profile argument."""
+    active_home, cli_profile, _ = _gateway_restart_profile_details(profile)
+    return active_home, cli_profile
+
+
+def _restart_command_for_active_profile(
+    profile: str | None = None,
+) -> tuple[list[str], dict[str, str], str]:
+    """Select the fixed system helper only for the active default gateway."""
+    active_home, cli_profile, raw_profile = _gateway_restart_profile_details(profile)
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(active_home)
+
+    active_default = (
+        profile is None
+        and (raw_profile == "default" or _is_root_profile(raw_profile))
+    )
+    if active_default:
+        system_state = _system_gateway_state()
+        if system_state is None:
+            raise RuntimeError(
+                "Could not determine whether the active default gateway is "
+                "system-managed; refusing to restart"
+            )
+        if system_state:
+            return ["sudo", "-n", _SYSTEM_GATEWAY_RESTART_HELPER], env, "system"
+
+    hermes_cmd = _resolve_hermes_command()
+    command = [hermes_cmd]
+    if cli_profile is not None:
+        command.extend(["--profile", cli_profile])
+    command.extend(["gateway", "restart"])
+    return command, env, "profile"
 
 
 def restart_active_profile_gateway(
     *,
+    profile: str | None = None,
     quick_timeout_seconds: float = 2.0,
     background_wait_seconds: float = 240.0,
 ) -> dict:
-    """Run a non-blocking gateway restart for the active profile/service scope."""
+    """Run a non-blocking ``hermes gateway restart`` for the active profile.
+
+    Returns a short status dict with these values:
+    - completed: command finished quickly and succeeded.
+    - in_progress: command did not finish within ``quick_timeout_seconds``.
+    - failed: command finished quickly with non-zero exit status.
+    - busy: restart already in progress from another caller.
+    """
     if not _GATEWAY_RESTART_LOCK.acquire(blocking=False):
         return {
             "status": "busy",
@@ -90,11 +157,10 @@ def restart_active_profile_gateway(
         }
 
     try:
-        hermes_cmd = _resolve_hermes_command()
-        command, env, scope = _restart_command_for_active_scope(hermes_cmd)
+        command, env, scope = _restart_command_for_active_profile(profile)
 
         logger.info(
-            "Restarting %s gateway service via CLI command: %s (HERMES_HOME=%s)",
+            "Restarting %s gateway via command: %s (HERMES_HOME=%s)",
             scope,
             " ".join(command),
             env.get("HERMES_HOME"),
@@ -118,7 +184,6 @@ def restart_active_profile_gateway(
                     "status": "completed",
                     "message": "Gateway service restarted successfully",
                     "detail": stdout or stderr,
-                    "scope": scope,
                 }
 
             logger.error("Gateway service restart failed with code %s: %s", proc.returncode, stderr)
@@ -127,12 +192,12 @@ def restart_active_profile_gateway(
                 "message": f"Restart failed: {stderr or stdout}",
                 "detail": stdout or stderr,
                 "returncode": proc.returncode,
-                "scope": scope,
             }
 
         except subprocess.TimeoutExpired:
             logger.info(
-                "Gateway restart is taking longer than %.1fs (likely draining in-flight runs); continuing in background",
+                "Gateway restart is taking longer than %.1fs (likely draining in-flight runs);"
+                " continuing in background",
                 quick_timeout_seconds,
             )
 
@@ -156,7 +221,9 @@ def restart_active_profile_gateway(
                             try:
                                 proc.wait(timeout=5.0)
                             except subprocess.TimeoutExpired:
-                                logger.error("Gateway restart process refused to die even after SIGKILL.")
+                                logger.error(
+                                    "Gateway restart process refused to die even after SIGKILL.",
+                                )
                     except Exception:
                         logger.exception("Failed to terminate timed out gateway restart process.")
                 finally:
@@ -166,7 +233,6 @@ def restart_active_profile_gateway(
             return {
                 "status": "in_progress",
                 "message": "Gateway service restart initiated (in progress)",
-                "scope": scope,
             }
     except Exception as exc:
         _release_lock()
