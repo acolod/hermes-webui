@@ -179,84 +179,43 @@ turn in the exhausted session instead of being blocked with recovery guidance.
 
 ## WebUI says update failed (agent or webui)
 
-**Symptom.** The WebUI update panel reports an update failure for either:
+**Symptom.** The WebUI update panel reports an update failure for either the WebUI or Agent, often mentioning local commits, restart failure, or a Git lock.
 
-- **WebUI** itself, or
-- **Agent**, often with language about local commits, fast-forward-only updates,
-  rebase failure, restart failure, or a git lock file.
-
-**Why.** This installation intentionally supports **local carry** workflows:
-
-- Hermes WebUI can carry local commits on top of `origin/master`
-- Hermes Agent can run from `local/live`, which is intentionally ahead of `main`
-
-So not every "ahead of remote" state is a bug. The important question is
-whether the correct updater wrapper ran:
-
-- WebUI local carries → `hermes-webui-local-update`
-- Agent local/live carries → `hermes-local-update`
+**Why.** This installation intentionally carries local commits on maintained `local/live` branches. Being ahead of upstream is expected. Both targets must route through the external maintained-downstream updater; they must not fall back to stock pull/reset behavior.
 
 **Diagnostic.**
 
-1. Check the WebUI carry runbook first:
-   ```bash
-   cd ~/hermes-webui
-   sed -n '1,220p' LOCAL_CARRY_NOTES.md
-   ```
-2. Inspect the current WebUI carry state:
-   ```bash
-   cd ~/hermes-webui
-   ~/.local/bin/hermes-webui-local-update --check
-   git log --oneline origin/master..HEAD
-   ```
-3. Inspect the current Agent carry state:
-   ```bash
-   ~/.local/bin/hermes-local-update --check
-   git -C ~/.hermes/hermes-agent log --oneline main..local/live
-   ```
-4. If the failure sounds like a routing bug, inspect the live source-of-truth
-   files named in `LOCAL_CARRY_NOTES.md`, especially:
-   - `api/updates.py`
-   - `api/gateway_restart.py`
-   - `api/routes.py`
-   - `static/ui.js`
-   - `tests/test_updates.py`
-   - `tests/test_gateway_restart_helper.py`
+```bash
+/home/alex/.local/bin/hermes-safe-update --json check all
+```
 
-**How to classify the failure.**
+Inspect `api/updates.py`, `api/external_update_adapter.py`, `api/gateway_restart.py`, `api/routes.py`, `static/ui.js`, `tests/test_updates.py`, and `tests/test_gateway_restart_helper.py` when routing or restart reporting is suspect.
 
-1. **Wrong updater path**
-   - Symptom: a local-carry checkout is treated as generic divergence or a plain
-     fast-forward-only update path runs.
-   - Check: `api/updates.py`, `api/routes.py`, `static/ui.js`.
-2. **Stale carry commit / replay conflict**
-   - Symptom: the wrapper ran, but rebase/cherry-pick failed replaying a local
-     customization onto new upstream.
-   - Check: `git log ...`, backup branches, and `LOCAL_CARRY_NOTES.md`.
-3. **Restart-only failure**
-   - Symptom: repo update succeeded, but the UI still reports failure because
-     gateway restart did not complete.
-   - Check: `api/gateway_restart.py` and service scope (`systemctl` vs
-     `systemctl --user`).
-4. **Lock-file failure**
-   - Symptom: `.git/index.lock` or similar blocks the update.
-   - Check: `api/updates.py` lock-recovery response and the exact manual command
-     returned by the API.
-5. **Force-update decision**
-   - Symptom: the user wants to discard local carries instead of preserving
-     them.
-   - Check: `/api/updates/force` behavior; this is intentionally destructive.
+Classify the failure by phase: updater selection, candidate conflict, dependency synchronization, fork publication, or restart/health verification. A successful source update followed by restart failure is not a failed source update.
 
-**Fix.** Use the wrapper-based path first. Do **not** jump straight to a hard
-reset unless you intend to discard local changes. If the wrapper itself fails,
-refresh the stale carry commit as a new commit on current upstream, then update
-`LOCAL_CARRY_NOTES.md`.
+**Fix.** Use the external updater/candidate workflow. Do not hard-reset, force-update, or run stock `hermes update` against maintained downstream branches. Preserve conflict candidates and resolve them in their isolated worktrees.
 
-**When to file a bug.** File a bug if:
+**When to file a bug.** File a bug if the normal update button bypasses the external updater, the UI misreports which phase failed, or the documented source-of-truth files no longer match the live code path.
 
-- the normal WebUI update button bypasses the wrapper for a local-carry repo,
-- the repo update succeeds but the UI misreports the phase that actually failed,
-- or the documented source-of-truth files no longer match the live code path.
+---
+
+## "Hermes Agent was updated while Hermes WebUI was running"
+
+**Symptom.** An action that uses the in-process Agent runtime stops with a message telling you to restart Hermes WebUI. This can happen after an Agent update or Git revision change while the WebUI backend remains running.
+
+**Why.** WebUI imports `run_agent.AIAgent` into a long-lived Python process. Continuing after the Agent revision changes could combine cached modules from the old revision with new source. Local Agent-backed chat therefore returns a retryable `409 agent_runtime_stale`; gateway-backed chat is not blocked by this local check.
+
+**Diagnostic.** Compare the running WebUI process start time with the Agent checkout revision and recent update history.
+
+**Fix.** Restart using the same manager that started WebUI:
+
+```bash
+systemctl --user restart hermes-webui.service
+```
+
+For a foreground `python3 bootstrap.py` launch, stop it with Ctrl-C and start it again.
+
+**When to file a bug.** File a bug if the message appears without an Agent revision change, or if a clean WebUI restart still produces the same import error. Include the launch method, WebUI revision, Agent revision, and sanitized error text.
 
 ---
 

@@ -34,6 +34,21 @@ def _make_run_git_side_effect(*sequence):
 _MODULE = 'api.updates'
 
 
+@pytest.fixture(autouse=True)
+def _isolate_stock_update_path(monkeypatch):
+    """Keep this module focused on the generic Git diagnostic path.
+
+    Machine-specific local-carry wrappers have their own behavior tests in
+    test_updates.py and test_external_downstream_routing.py. Without this
+    isolation their extra Git probes consume this module's deliberately exact
+    mocked command sequences before the stock pull path is reached.
+    """
+    from api import updates
+
+    monkeypatch.setattr(updates, '_webui_update_applyability_info', lambda: None)
+    monkeypatch.setattr(updates, '_agent_update_applyability_info', lambda: None)
+
+
 # ---------------------------------------------------------------------------
 # Tests for _apply_update_inner() diagnostic paths
 # ---------------------------------------------------------------------------

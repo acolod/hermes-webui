@@ -87,6 +87,7 @@ def test_missing_managed_updater_refuses_without_stock_fallback(tmp_path):
 
     assert result["webui"]["reason"] == "managed_updater_unavailable"
     assert result["webui"]["can_apply"] is False
+    assert str(tmp_path) not in result["webui"]["message"]
     stock_check.assert_not_called()
     stock_git.assert_not_called()
 
@@ -94,7 +95,11 @@ def test_missing_managed_updater_refuses_without_stock_fallback(tmp_path):
 def test_invalid_managed_updater_json_refuses_without_stock_fallback(tmp_path):
     updater = tmp_path / "updater"
     updater.write_text("stub", encoding="utf-8")
-    proc = MagicMock(stdout="not json", stderr="invalid JSON", returncode=2)
+    proc = MagicMock(
+        stdout="not json SECRET_TOKEN",
+        stderr="invalid JSON SECRET_TOKEN",
+        returncode=0,
+    )
     with patch.object(adapter, "UPDATER", updater), \
          patch.object(adapter.subprocess, "run", return_value=proc), \
          patch.object(updates, "managed_check", adapter.managed_check), \
@@ -111,6 +116,7 @@ def test_invalid_managed_updater_json_refuses_without_stock_fallback(tmp_path):
 
     assert result["webui"]["reason"] == "managed_updater_invalid_response"
     assert result["webui"]["can_apply"] is False
+    assert "SECRET_TOKEN" not in result["webui"]["message"]
     stock_check.assert_not_called()
     stock_git.assert_not_called()
 
@@ -157,3 +163,163 @@ def test_managed_apply_failure_never_calls_stock_update():
     assert result == payload
     stock_apply.assert_not_called()
     stock_git.assert_not_called()
+
+
+def test_managed_updater_timeout_fails_closed(tmp_path):
+    updater = tmp_path / "updater"
+    updater.write_text("stub", encoding="utf-8")
+    with patch.object(adapter, "UPDATER", updater), patch.object(
+        adapter.subprocess, "run", side_effect=adapter.subprocess.TimeoutExpired("updater", 60)
+    ):
+        result = adapter.managed_check("agent")
+
+    assert result["ok"] is False
+    assert result["reason"] == "managed_updater_timeout"
+
+
+def test_managed_updater_os_error_fails_closed(tmp_path):
+    updater = tmp_path / "updater"
+    updater.write_text("stub", encoding="utf-8")
+    with patch.object(adapter, "UPDATER", updater), patch.object(
+        adapter.subprocess, "run", side_effect=OSError("exec failed")
+    ):
+        result = adapter.managed_check("webui")
+
+    assert result["ok"] is False
+    assert result["reason"] == "managed_updater_execution_failed"
+
+
+def test_managed_updater_nonzero_json_cannot_report_success(tmp_path):
+    updater = tmp_path / "updater"
+    updater.write_text("stub", encoding="utf-8")
+    proc = MagicMock(stdout='{"ok": true, "message": "updated"}', stderr="failed", returncode=7)
+    with patch.object(adapter, "UPDATER", updater), patch.object(
+        adapter.subprocess, "run", return_value=proc
+    ):
+        result = adapter.managed_update("agent")
+
+    assert result["ok"] is False
+    assert result["reason"] == "managed_updater_nonzero_exit"
+
+
+def test_managed_updater_success_requires_results_contract(tmp_path):
+    updater = tmp_path / "updater"
+    updater.write_text("stub", encoding="utf-8")
+    proc = MagicMock(stdout='{"ok": true}', stderr="", returncode=0)
+    with patch.object(adapter, "UPDATER", updater), patch.object(
+        adapter.subprocess, "run", return_value=proc
+    ):
+        result = adapter.managed_update("agent")
+
+    assert result["ok"] is False
+    assert result["reason"] == "managed_updater_invalid_response"
+
+
+def test_managed_updater_refuses_wrong_target_result(tmp_path):
+    updater = tmp_path / "updater"
+    updater.write_text("stub", encoding="utf-8")
+    proc = MagicMock(
+        stdout='{"ok": true, "results": [{"ok": true, "target": "webui"}]}',
+        stderr="",
+        returncode=0,
+    )
+    with patch.object(adapter, "UPDATER", updater), patch.object(
+        adapter.subprocess, "run", return_value=proc
+    ):
+        result = adapter.managed_update("agent")
+
+    assert result["ok"] is False
+    assert result["reason"] == "managed_updater_target_mismatch"
+
+
+def test_managed_check_accepts_authoritative_single_target_contract(tmp_path):
+    updater = tmp_path / "updater"
+    updater.write_text("stub", encoding="utf-8")
+    payload = {
+        "ok": True,
+        "results": [{
+            "target": "agent",
+            "head": "abc",
+            "upstream_ref": "upstream/main",
+            "local_only": 1,
+            "upstream_only": 2,
+            "upstream_commits": ["123 change"],
+            "up_to_date": False,
+        }],
+    }
+    proc = MagicMock(stdout=__import__("json").dumps(payload), stderr="", returncode=0)
+    with patch.object(adapter, "UPDATER", updater), patch.object(
+        adapter.subprocess, "run", return_value=proc
+    ):
+        result = adapter.managed_check("agent")
+
+    assert result == payload
+
+
+def test_managed_check_rejects_inconsistent_up_to_date_invariant(tmp_path):
+    updater = tmp_path / "updater"
+    updater.write_text("stub", encoding="utf-8")
+    payload = {
+        "ok": True,
+        "results": [{
+            "target": "agent", "head": "abc", "upstream_ref": "upstream/main",
+            "local_only": 1, "upstream_only": 2,
+            "upstream_commits": ["123 change"], "up_to_date": True,
+        }],
+    }
+    proc = MagicMock(stdout=__import__("json").dumps(payload), stderr="", returncode=0)
+    with patch.object(adapter, "UPDATER", updater), patch.object(
+        adapter.subprocess, "run", return_value=proc
+    ):
+        result = adapter.managed_check("agent")
+    assert result["ok"] is False
+    assert result["reason"] == "managed_updater_invalid_response"
+
+
+def test_managed_check_rejects_unknown_fields(tmp_path):
+    updater = tmp_path / "updater"
+    updater.write_text("stub", encoding="utf-8")
+    payload = {
+        "ok": True,
+        "unexpected": "must not flow through",
+        "results": [{
+            "target": "agent", "head": "abc", "upstream_ref": "upstream/main",
+            "local_only": 1, "upstream_only": 0,
+            "upstream_commits": [], "up_to_date": True,
+        }],
+    }
+    proc = MagicMock(stdout=__import__("json").dumps(payload), stderr="", returncode=0)
+    with patch.object(adapter, "UPDATER", updater), patch.object(
+        adapter.subprocess, "run", return_value=proc
+    ):
+        result = adapter.managed_check("agent")
+    assert result["ok"] is False
+    assert result["reason"] == "managed_updater_invalid_response"
+
+
+def test_managed_update_failure_message_is_normalized(tmp_path):
+    updater = tmp_path / "updater"
+    updater.write_text("stub", encoding="utf-8")
+    payload = {
+        "ok": False,
+        "results": [{
+            "ok": False, "target": "agent", "candidate_id": "1234567890-abcd1234",
+            "original_head": "a" * 40, "new_head": "b" * 40,
+            "recovery_tag": "recovery/agent-test",
+            "bundle": "/private/path/SECRET_TOKEN.bundle",
+            "restart_required": True,
+            "message": "restart failed with SECRET_TOKEN",
+        }],
+    }
+    proc = MagicMock(stdout=__import__("json").dumps(payload), stderr="", returncode=0)
+    with patch.object(adapter, "UPDATER", updater), patch.object(
+        adapter.subprocess, "run", return_value=proc
+    ):
+        result = adapter.managed_update("agent")
+    assert result == {
+        "ok": False,
+        "target": "agent",
+        "reason": "managed_update_restart_required",
+        "message": "Agent code was updated, but restart or health verification did not complete.",
+    }
+    assert "SECRET_TOKEN" not in __import__("json").dumps(result)
